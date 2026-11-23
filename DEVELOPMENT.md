@@ -376,7 +376,7 @@ When a user chooses the entry, the app calls the API command `providers/open_pag
 
 * The server calls it only while that user may still use the instance and holds the scope of the page, and runs it as that user (`get_current_user()`). An address lapses after 15 minutes without a request and after 12 hours in any case.
 * The page runs sandboxed in an origin of its own. It gets no token or cookie and can not reach the app, so it talks to the provider through relative urls to its own sub-paths (a `fetch` with JSON included). The server sets the security headers on every response and removes any cookie.
-* A page may not offer downloads of provider audio (see the [Usage Policy](https://github.com/music-assistant/.github/blob/main/USAGE_POLICY.md)); the sandbox blocks downloads.
+* A page may not offer downloads of provider audio; the sandbox blocks downloads.
 
 The demo plugin (`_demo_plugin_provider`) declares a one-line page.
 
@@ -387,7 +387,7 @@ A provider that ships with Music Assistant is installed for every user and suppo
 
 * **People ask for it.** Link the feature request or discussion that shows the demand.
 * **It is documented.** A pull request on the [documentation](https://github.com/music-assistant/music-assistant.io/blob/main/CONTRIBUTING.md) comes with it.
-* **It meets the standards.** It follows this guide and the [usage policy](https://github.com/music-assistant/.github/blob/main/USAGE_POLICY.md), passes `lint` and `test`, and has tests of its own.
+* **It meets the standards.** It follows this guide and the usage policy in `AGENTS.md`, passes `lint` and `test`, and has tests of its own.
 * **You maintain it.** You are listed in `codeowners` and keep following up on bug reports and on changes in the service, the device or the server.
 
 A provider whose maintainer no longer follows up may be moved out of the server to the [community catalog](https://github.com/music-assistant/.github/blob/main/COMMUNITY_CATALOG_RULES.md). That is announced first, so that someone can take it over. A maintainer can also move their own provider there, to release it from their own repository. Users keep it either way: a server that has it set up installs it from the community catalog after the upgrade, with its settings. How a move goes, and the check that guards it, is in the [community catalog README](music_assistant/controllers/community_catalog/README.md#moved-providers).
@@ -399,7 +399,7 @@ Every provider in this repository is reviewed against the same usage policy, who
 Bot-MArley, the maintainers' review bot, reviews every PR that is ready for review within about an hour of its last push, and approves it when the review is clean and the change stays inside one provider. An approval does not merge the PR. As a codeowner of that provider, comment `@Bot-MArley merge` on a line of its own, and the bot adds the PR to the merge queue once its current commit is approved and `lint` and `test` are green. This works on PRs into `dev` that only change your provider's folders (`music_assistant/providers/<domain>/` and `tests/providers/<domain>/`), whoever opened them. After a new push, ask again.
 
 A maintainer still approves or merges:
-* a new provider, after checking it against the [usage policy](https://github.com/music-assistant/.github/blob/main/USAGE_POLICY.md);
+* a new provider, after checking it against the usage policy in `AGENTS.md`;
 * a change to your provider's `codeowners` or `support_url`;
 * a change to `requirements`, or to anything outside your provider's folders;
 * a PR of 1,000 changed lines or more;
