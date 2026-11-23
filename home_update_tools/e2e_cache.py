@@ -7,7 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 from aiohttp import web
@@ -176,6 +176,23 @@ async def main() -> None:
             names = sorted(p.name for p in Path(tmp).rglob("*") if p.is_file() and ".ma-audio-cache" not in p.parts)
             print("7. cover fetch fails -> audio kept:", bool(cached), "| files:", names)
             assert cached and names == ["01 Sine Song.m4a"], names
+
+    # 8. hit on an album that has no cover: it is fetched in the background
+    async with aiohttp.ClientSession() as session:
+        provider.mass = fake_mass(session, tasks)
+        provider.get_track = AsyncMock(return_value=track())
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = AudioCache(provider, tmp)
+            await cache.setup()
+            _ = await pcm(cache.stream_and_store("42", dl, track()), ["-decryption_key", KEY])
+            await asyncio.gather(*tasks)
+            cached = await cache.lookup("42", KEY_ID)
+            cover = Path(cached).parent / "cover.jpg"
+            cover.unlink()
+            cache.start_missing_cover("42", cached)
+            await asyncio.gather(*tasks)
+            print("8. hit on an album without a cover -> cover fetched:", cover.exists() and cover.read_bytes() == COVER)
+            assert cover.read_bytes() == COVER
 
     await runner.cleanup()
     print("ALL OK")

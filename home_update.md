@@ -1,6 +1,6 @@
 # Updating the home Music Assistant server (Apple Music audio cache)
 
-How to get this fork's Apple Music audio cache onto the production Music Assistant (MA) container at home, keep it there, and roll it back. Written 2026-11-23 against MA **2.10.13**, and updated the same day for the album covers and the index-folder fix. The code is deployed straight from the repository: nothing is ported by hand.
+How to get this fork's Apple Music audio cache onto the production Music Assistant (MA) container at home, keep it there, and roll it back. Written 2026-11-23 against MA **2.10.13**, and updated the same day for the album covers, the index-folder fix and a restructure that keeps the branch out of upstream's files. The code is deployed straight from the repository: nothing is ported by hand.
 
 The testing status of every procedure is in [section 9](#9-testing-status-and-known-gaps). Anything marked "not tested" there has not been run.
 
@@ -24,7 +24,7 @@ git -C "$REPO" remote add upstream https://github.com/music-assistant/server.git
 git -C "$REPO" fetch upstream stable --tags
 ```
 
-The Apple Music provider instance id is looked up from the settings file where needed (it differs per install).
+The cache folder is set with an environment variable in the compose file (section 2.2), not in MA's settings, so no provider instance id is needed anywhere.
 
 ## 1. Which procedure do I need?
 
@@ -39,17 +39,17 @@ The Apple Music provider instance id is looked up from the settings file where n
 
 ## 2. What this is
 
-- **Feature:** an optional "Audio cache folder" setting on the Apple Music provider. When set, the first play of a track downloads Apple's encrypted file through MA and keeps a copy under `Artist/Album/NN Title.m4a`. Later plays read that file and decrypt it with a fresh licence key, so no audio is downloaded again.
+- **Feature:** an optional environment variable, `MASS_APPLE_MUSIC_AUDIO_CACHE`, that names a folder inside the container. When it is set, the first play of a track downloads Apple's encrypted file through MA and keeps a copy under `Artist/Album/NN Title.m4a`. Later plays read that file and decrypt it with a fresh licence key, so no audio is downloaded again.
 - **The files stay encrypted** (Widevine). Only MA with a valid Apple Music account can play them. The decryption key is never stored.
 - **Only complete downloads are kept.** A skipped or failed download leaves nothing behind. Radio and the user's own uploaded (unencrypted) library tracks are not cached. There is no size cap.
 - **What is kept next to the audio, and where the metadata is.** The `.m4a` is exactly the file Apple serves, and it is never rewritten: it carries no artist, album or title tags and no picture (checked with `ffprobe` and by reading its MP4 boxes: no `meta`, `ilst` or `covr`; the only extras are the technical tags and Apple's loudness data). The metadata is kept beside it instead:
   - the folder and file name (`Artist/Album/NN Title.m4a`);
-  - `cover.jpg` in the album folder: the album's artwork as a JPEG, fetched in the background through MA's own image functions once a track of the album has been stored, and only when the folder has none yet. A track without artwork, or a failed fetch, simply leaves no cover and does not affect the audio;
+  - `cover.jpg` in the album folder: the album's artwork as a JPEG, fetched in the background through MA's own image functions, when a track of the album is stored and when a track is played from the cache, and only while the folder has none. A track without artwork, or a failed fetch, simply leaves no cover and does not affect the audio;
   - a small record per track in `.ma-audio-cache/<id>.json` (item id, key id, relative path, size, artist, album, title, time cached), which the cache uses to recognise a file. It never holds a key.
 - **Branches in the repository:**
-  - `apple-music-audio-cache`: the code. It is upstream `stable` plus three commits, so it deploys onto the stable image without porting: the cache itself; "recreate the index folder when it has gone" (before it, clearing the cache folder while MA ran stopped every later download from being kept, see section 8); and "keep the album cover next to the tracks". Nothing but code, strings and generated translations is on it.
+  - `apple-music-audio-cache`: the code. It is upstream `stable` plus one commit, so it deploys onto the stable image without porting. It adds two new files, `audio_cache.py` (the storage) and `cached_provider.py` (a subclass of the provider and of its streaming manager), and changes two lines of one upstream file: `__init__.py`, where `setup()` returns the subclass. `constants.py`, `provider.py`, `streaming.py`, `strings.json` and `en.json` are exactly upstream's. That is what keeps moving to a newer MA version small: the logic never sits inside a function upstream also changes. Nothing but code is on the branch.
   - `audio-cache-policy`: the documentation, including this guide and the helper scripts in `home_update_tools/`.
-- **What gets deployed** (six files, copied into the running container): from `music_assistant/providers/apple_music/` the files `audio_cache.py` (new), `constants.py`, `provider.py`, `streaming.py` and `strings.json`; plus `music_assistant/translations/en.json`, which MA loads at runtime for the setting's label and description. Everything else in the container stays as the image shipped it.
+- **What gets deployed:** every file of `music_assistant/providers/apple_music/` (23 at the time of writing; the branch changes only `__init__.py` and adds `audio_cache.py` and `cached_provider.py`) plus `music_assistant/translations/en.json`. All the others are identical to the image, so copying them all also puts back anything an older version of the branch had changed. Everything else in the container stays as the image shipped it.
 
 ### 2.1 Production layout (as of 2026-11-23)
 
@@ -60,13 +60,15 @@ The Apple Music provider instance id is looked up from the settings file where n
 | Data volume | `music-assistant_music-assistant-data` mounted at `/data` (settings, library, auth databases; about 225 MB) |
 | Local music library | host `$MUSIC_DIR` mounted **read-only** at `/media/music` (the "Filesystem (local disk)" provider reads `/media`) |
 | Audio cache | host `$CACHE_DIR` mounted **read-write** at `/music-cache`, deliberately outside `/media` so the local library never indexes the encrypted files |
-| Setting | on the Apple Music provider instance: `audio_cache_path` = `/music-cache` (stored in the data volume) |
+| Setting | the environment variable `MASS_APPLE_MUSIC_AUDIO_CACHE=/music-cache` in the compose file (not in MA's settings) |
 | How the code gets in | copied into the container's writable layer: it survives `docker restart` and is **lost when the container is recreated** |
 
 ### 2.2 The compose file (the relevant part)
 
 ```yaml
     image: ghcr.io/music-assistant/server:latest
+    environment:
+      - MASS_APPLE_MUSIC_AUDIO_CACHE=/music-cache   # path inside the container; empty or removed turns the cache off
     volumes:
       - music-assistant-data:/data
       - <your music folder>:/media/music:ro
@@ -94,7 +96,7 @@ Nothing in `$CACHE_DIR` needs backing up: it is a cache and refills itself.
 
 ## 4. Procedure A: deploy the code (same MA version)
 
-Use this for the first deploy, and after any container recreation (the copied files are lost then; the setting stays in the data volume).
+Use this for the first deploy, and after any container recreation (the copied files are lost then; the environment variable stays in the compose file). A change to the compose file recreates the container, so after one run `cd $STACK && docker compose up -d --no-start` and then this procedure: the deploy script starts the container.
 
 **1. Set up the tools folder (once).** The helper scripts are on the `audio-cache-policy` branch in `home_update_tools/`. Copy that folder's three files into `$TOOLS`, and create the synthetic encrypted test track used by the smoke test:
 
@@ -108,11 +110,11 @@ ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=440:duration=6" -c:a aac -
   -encryption_kid 0f0e0d0c0b0a09080706050403020100 "$TOOLS"/enc.m4a
 ```
 
-**2. Check the checkout.** It must be on the code branch, clean, and only the feature commits (section 2) on top of upstream `stable`:
+**2. Check the checkout.** It must be on the code branch, clean, and exactly one commit on top of upstream `stable`:
 
 ```bash
 git -C "$REPO" status -sb                      # on apple-music-audio-cache, nothing modified
-git -C "$REPO" log --oneline upstream/stable..HEAD    # only the feature commits
+git -C "$REPO" log --oneline upstream/stable..HEAD    # exactly the feature commit
 ```
 
 **3. Check nothing is playing**, because MA restarts at the end (about a minute). No lines, or a "Finished" after the last "Start", means idle:
@@ -128,12 +130,10 @@ IMG=$(docker inspect music-assistant --format '{{.Image}}')
 PKG=$(docker run --rm --entrypoint /app/venv/bin/python $IMG -c 'import importlib.util,os; print(os.path.dirname(importlib.util.find_spec("music_assistant").origin))')/providers/apple_music
 R=$REPO/music_assistant/providers/apple_music
 docker run --rm --network none --entrypoint /app/venv/bin/python \
-  -v $R/constants.py:$PKG/constants.py:ro -v $R/provider.py:$PKG/provider.py:ro \
-  -v $R/streaming.py:$PKG/streaming.py:ro -v $R/audio_cache.py:$PKG/audio_cache.py:ro \
-  -v $TOOLS:/t:ro $IMG -I /t/e2e_cache.py /t/enc.m4a 2>&1 | grep -E "^[0-9]\.|reference|ALL OK|Traceback"
+  -v $R:$PKG:ro -v $TOOLS:/t:ro $IMG -I /t/e2e_cache.py /t/enc.m4a 2>&1 | grep -E "^[0-9]\.|reference|ALL OK|Traceback"
 ```
 
-You must see steps `1.` to `7.` and `ALL OK` on the last line. Step 1 also checks that a `cover.jpg` appears next to the track while the audio file stays byte-identical, and step 7 that a failed cover fetch costs nothing but the cover. (The test stands in for MA's task and image functions, so it does not fetch a real picture.) One `Traceback` line from a `ClientConnectionResetError` is expected (the test's fake slow server noticing the client hung up). Any other traceback, or no `ALL OK`: stop, do not deploy.
+You must see steps `1.` to `8.` and `ALL OK` on the last line. Step 1 also checks that a `cover.jpg` appears next to the track while the audio file stays byte-identical, step 7 that a failed cover fetch costs nothing but the cover, and step 8 that playing a cached track whose album has no cover fetches it. (The test stands in for MA's task and image functions, so it does not fetch a real picture.) One `Traceback` line from a `ClientConnectionResetError` is expected (the test's fake slow server noticing the client hung up). Any other traceback, or no `ALL OK`: stop, do not deploy.
 
 **5. Dry run of the safety checks** (changes nothing):
 
@@ -149,20 +149,20 @@ It must print `checks passed: ...` and `dry run: nothing changed`. The checks ar
 REPO=$REPO BACKUP_DIR=$BACKUP_DIR $TOOLS/deploy-audiocache.sh
 ```
 
-It saves the files being replaced to `$BACKUP_DIR/pre-deploy-<time>/`, copies the six files in, compares each byte for byte with the checkout, then restarts MA. It stops with an error, before restarting, if any file differs after the copy.
+It saves the files being replaced to `$BACKUP_DIR/pre-deploy-<time>/`, copies every file of the provider folder and `en.json` in, compares each byte for byte with the checkout, then restarts MA. It also names any file the container has that the checkout has not. It stops with an error, before restarting, if any file differs after the copy.
 
-**7. Verify** ([section 6](#6-verify)), and check the setting survived:
+**7. Verify** ([section 6](#6-verify)), and check the container has the setting:
 
 ```bash
-docker cp music-assistant:/data/settings.json - | tar -xO | python3 -I -c "import json,sys; [print(k, v.get('values', {}).get('audio_cache_path')) for k, v in json.load(sys.stdin)['providers'].items() if v.get('domain') == 'apple_music']"
-# expect one line per Apple Music instance, ending in: /music-cache
+docker exec music-assistant printenv MASS_APPLE_MUSIC_AUDIO_CACHE
+# expect: /music-cache
 ```
 
-If an instance shows `None`, the setting was lost (see section 9): set it again (section 8).
+If it prints nothing, the compose file does not set it (section 2.2): add it and recreate the container (section 8).
 
 ## 5. Procedure B: move to a new MA version
 
-The branch is a few commits on top of upstream `stable`, so a new MA version means rebasing those commits onto the code the new image was built from, then deploying as in Procedure A.
+The branch is one commit on top of upstream `stable`, so a new MA version means rebasing that commit onto the code the new image was built from, then deploying as in Procedure A.
 
 1. **Back up** (section 3). Leave MA stopped.
 2. **Pull and recreate without starting**, and note the version:
@@ -178,13 +178,17 @@ The branch is a few commits on top of upstream `stable`, so a new MA version mea
    OLD=$(git -C "$REPO" merge-base HEAD upstream/stable)       # the current base of the branch
    git -C "$REPO" rebase --onto "$REV" "$OLD" HEAD
    ```
-   If it stops on conflicts, resolve them by hand. The change points are:
-   - `constants.py`: the four constants `CONF_AUDIO_CACHE_PATH`, `AUDIO_CACHE_INDEX_DIR`, `AUDIO_CACHE_FILE_SUFFIX`, `AUDIO_CACHE_COVER_NAME`.
-   - `streaming.py`: an `audio_cache` attribute set to `None` in `__init__`; in `initialize()`, read the setting and open the cache; in `get_stream_details()`, for the encrypted track branch return one of three results (cache off: the unchanged `ENCRYPTED_HTTP`; hit: same type with the cached file as `path`; miss: `StreamType.CUSTOM` with `extra_input_args=["-decryption_key", key]`, `data=AudioDownload(...)`, `can_seek=False`, `allow_seek=True`); plus the new method `stream_track_and_store()`.
-   - `provider.py`: the `audio_cache_path` string entry in `get_config_entries()`, and a `get_audio_stream()` that hands an `AudioDownload` stream to `streaming_manager.stream_track_and_store()`. If the new MA already has a `get_audio_stream` on this provider (for example for live radio), dispatch on `isinstance(streamdetails.data, AudioDownload)` and keep the existing behaviour for everything else.
-   - `strings.json` and `translations/en.json`: the label and description of the setting. Regenerate `en.json` with `python -m scripts.build_translations` instead of merging it by hand.
-   - Check that the core still treats `CUSTOM` streams the same way: `_resolve_media_stream_source` in `controllers/streams/audio.py` must pass the stream's `extra_input_args` to ffmpeg and call `provider.get_audio_stream()` for a track.
-   - Check the three core functions the cover code (`_store_cover` and `_fetch_cover` in `audio_cache.py`) calls, because the new image may have changed them: `mass.create_task(target, *args, task_id=...)` in `mass.py`, and `mass.metadata.get_image_url_for_item(item, image_type)` and `mass.metadata.get_thumbnail(path, provider, size, image_format, flatten_transparency)` in `controllers/metadata/images.py`. If one changed, adjust the calls; the unit tests mock them, so they will not notice.
+   Only `__init__.py` is a file of upstream, so a conflict can only come from upstream changing `setup()` or the imports there: keep upstream's version and put back the one import and the one `return CachingAppleMusicProvider(...)` line. (A merge works as well and needs no force-push: `git merge "$REV"` gives one conflict resolution. `git config rerere.enabled true` makes git remember resolutions.)
+
+   **Check what `cached_provider.py` relies on in upstream.** Replaying cleanly does not mean it still works, because the unit tests mock the rest:
+   - the provider creates `self.streaming_manager` in `__init__` and `handle_async_init` calls its `initialize()`;
+   - `get_stream_details(item_id)` of the streaming manager still returns, for an encrypted track, a `StreamDetails` of type `ENCRYPTED_HTTP` with the file's URL as `path` and the key as `decryption_key` (anything else is left alone, so a new stream type of upstream is not cached but still plays);
+   - `_get_decryption_key` still has parameters named `key_id` (bytes) and `item_id`. They are looked up by name; if upstream renames them, tracks still play and the log says `Audio cache skipped, no key id in the key request`, so check the log after an upgrade;
+   - `MusicProvider.get_audio_stream(streamdetails, seek_position)`: if upstream's provider defines its own, our subclass hands it everything that is not ours;
+   - the core's handling of `CUSTOM` streams: `_resolve_media_stream_source` in `controllers/streams/audio.py` must pass the stream's `extra_input_args` to ffmpeg and call `provider.get_audio_stream()` for a track;
+   - for the covers: `provider.get_track(item_id)` (used to find the picture of a track that is played from the cache), `mass.create_task(target, *args, task_id=...)` in `mass.py`, and `mass.metadata.get_image_url_for_item(item, image_type)` and `mass.metadata.get_thumbnail(path, provider, size, image_format, flatten_transparency)` in `controllers/metadata/images.py`.
+
+   The tests fail first if one of these changed: `test_the_key_function_of_upstream_still_has_the_parameters_we_look_for`, `test_setup_gives_the_provider_that_keeps_audio` and the stream-details tests.
 4. **Re-run the project checks** from the checkout (needs the project's dev environment, see `scripts/setup.sh`): `pre-commit run --files <the changed files>` and `pytest tests/providers/apple_music`. Any failure: stop, do not deploy.
 5. **Smoke test against the new image**: Procedure A, step 4 (`IMG` now resolves to the new image because the container was recreated).
 6. **Deploy**: Procedure A, steps 5 and 6. The script works on the stopped container and starts it.
@@ -214,7 +218,7 @@ curl -s localhost:8095/info | python3 -c "import json,sys; print(json.load(sys.s
 
 Then a real test with an Apple Music track:
 
-1. Play a track right through, once. A folder `$CACHE_DIR/<Artist>/<Album>/` with the `.m4a` should appear, no `.part` file left, and `.ma-audio-cache/<id>.json` next to it. A few seconds after the track is stored a `cover.jpg` should appear in the same album folder (`file "$CACHE_DIR/<Artist>/<Album>/cover.jpg"` should say JPEG). Tracks cached by an earlier deploy keep working: the cache format did not change, but they get no cover, because a cover is only fetched when a track is stored (section 8).
+1. Play a track right through, once. A folder `$CACHE_DIR/<Artist>/<Album>/` with the `.m4a` should appear, no `.part` file left, and `.ma-audio-cache/<id>.json` next to it. A few seconds after the track is stored a `cover.jpg` should appear in the same album folder (`file "$CACHE_DIR/<Artist>/<Album>/cover.jpg"` should say JPEG). Tracks cached by an earlier deploy keep working, the cache format did not change; they get their cover the first time they are played from the cache (section 8).
 2. Play the **same** track again (any device). There should be **no new or changed file**: same size and same modified time, and no duplicate named `... [<id>].m4a`. A duplicate or new `.part` means it downloaded again.
 3. For direct proof, run the watcher during the second play and look for an `OPEN` of the `.m4a` with no `CREATE` of a `.part`:
    ```bash
@@ -224,7 +228,7 @@ Then a real test with an Apple Music track:
 
 ## 7. Rollback
 
-**Back to the stock image, cache code gone (simplest).** Recreate the container from the image: the copied files disappear and the stock Apple Music code is back. The leftover `audio_cache_path` setting should be ignored by stock code, but this is **not tested**; clear it (section 8) if MA complains. Cached files in `$CACHE_DIR` are simply unused.
+**Back to the stock image, cache code gone (simplest).** Recreate the container from the image: the copied files disappear and the stock Apple Music code is back. Stock code does not read the environment variable (remove it from the compose file if you like), and the `audio_cache_path` setting that earlier versions stored in the data volume is ignored too; that last point is **not tested**. Cached files in `$CACHE_DIR` are simply unused.
 
 ```bash
 cd $STACK && docker compose up -d --force-recreate
@@ -248,39 +252,25 @@ If the image tag is the newer one you are rolling away from, point `image:` in t
 
 ## 8. Operating notes
 
-**Change or turn off the cache folder.** In the MA web UI: Settings, Providers, Apple Music, edit, "Audio cache folder". Empty turns the cache off. The path is the path **inside the container**, so it must be a mounted folder (`/music-cache`). Or edit the stored value with MA stopped:
+**Change or turn off the cache folder.** Edit `MASS_APPLE_MUSIC_AUDIO_CACHE` in the compose file. It is the path **inside the container**, so it must be a mounted folder (`/music-cache`); empty, or removing the line, turns the cache off. The change needs the container recreated, which loses the copied code, so keep a copy of the compose file and run:
 
 ```bash
-docker stop music-assistant
-T=$(mktemp -d)                      # private (mode 700): the settings file holds secrets
-docker cp music-assistant:/data/settings.json "$T"/settings.json
-BAK=$STACK/settings.json.bak-$(date +%Y%m%d-%H%M)
-cp "$T"/settings.json "$BAK" && chmod 600 "$BAK"
-python3 -I - "$T"/settings.json <<'EOF'
-import json, sys
-p = sys.argv[1]
-d = json.load(open(p))
-for instance_id, config in d["providers"].items():
-    if config.get("domain") == "apple_music":
-        config.setdefault("values", {})["audio_cache_path"] = "/music-cache"   # "" turns it off
-        print(instance_id, config["values"])
-json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
-EOF
-docker cp "$T"/settings.json music-assistant:/data/settings.json
-rm -rf "$T"
-docker start music-assistant
+cp $STACK/docker-compose.yml $STACK/docker-compose.yml.bak-$(date +%Y%m%d)
+cd $STACK && docker compose up -d --no-start
+REPO=$REPO BACKUP_DIR=$BACKUP_DIR $TOOLS/deploy-audiocache.sh     # starts the container
 ```
-Never print `settings.json` itself: it contains MA's encryption key.
+
+Earlier versions of the branch had an "Audio cache folder" field on the provider; if `settings.json` in the data volume still has an `audio_cache_path` value under the Apple Music instance, nothing reads it and it can stay. Never print `settings.json`: it contains MA's encryption key.
 
 **See how big it is:** `du -sh $CACHE_DIR` (about 5 to 18 MB per track so far). There is no size cap.
 
-**Empty the cache** (safe: it refills as you play): `docker exec music-assistant sh -c 'rm -rf /music-cache/* /music-cache/.ma-audio-cache'`. The files belong to root (the container runs as root), so deleting them from the host needs `sudo`. Emptying the folder while MA runs is fine from the commit "recreate the index folder when it has gone" onward: the next download recreates `.ma-audio-cache` by itself.
+**Empty the cache** (safe: it refills as you play): `docker exec music-assistant sh -c 'rm -rf /music-cache/* /music-cache/.ma-audio-cache'`. The files belong to root (the container runs as root), so deleting them from the host needs `sudo`. Emptying the folder while MA runs is fine on the code deployed since 2026-11-23 22:27: the next download recreates `.ma-audio-cache` by itself.
 
-**If nothing is being kept after the folder was cleared.** Symptom, in the MA log on every play of a track that is not cached: `Could not start storing audio in /music-cache: [Errno 2] No such file or directory: '/music-cache/.ma-audio-cache/<id>.part'`. Playback itself is fine. This happens on code from before that commit, because the index folder was only created when MA started. Fix: deploy the current code (Procedure A), or as a stopgap create the folder (`mkdir $CACHE_DIR/.ma-audio-cache`) or restart MA. Check the folder is the same one the container sees: `stat -c %i $CACHE_DIR` on the host and `docker exec music-assistant stat -c %i /music-cache` must print the same number (a host folder that was deleted and recreated may leave the container looking at the old, deleted one, which a `docker restart music-assistant` should fix; not tested here, the one time this was investigated the numbers matched and the folder had only been emptied).
+**If nothing is being kept after the folder was cleared.** Symptom, in the MA log on every play of a track that is not cached: `Could not start storing audio in /music-cache: [Errno 2] No such file or directory: '/music-cache/.ma-audio-cache/<id>.part'`. Playback itself is fine. This happened on code from before 2026-11-23 22:27, because the index folder was only created when MA started. Fix: deploy the current code (Procedure A), or as a stopgap create the folder (`mkdir $CACHE_DIR/.ma-audio-cache`) or restart MA. Check the folder is the same one the container sees: `stat -c %i $CACHE_DIR` on the host and `docker exec music-assistant stat -c %i /music-cache` must print the same number (a host folder that was deleted and recreated may leave the container looking at the old, deleted one, which a `docker restart music-assistant` should fix; not tested here, the one time this was investigated the numbers matched and the folder had only been emptied).
 
 **Where files go:** `$CACHE_DIR/<Artist>/<Album>/<NN> <Title>.m4a` and `$CACHE_DIR/<Artist>/<Album>/cover.jpg` (album artist when the album has one, `2-03 Title` for disc 2). A second file named `... [<id>].m4a` only appears when two different tracks would get the same name. Both are in the album folder, and the cover is one file per album.
 
-**Covers.** A cover is fetched in the background right after a track is stored, if the album folder has no `cover.jpg` yet. It is not fetched when a cached track is replayed, so tracks cached before covers existed, and albums whose fetch failed (no network to the image server, no artwork), stay without one until another track of that album is stored. To give an album its cover, delete that track's `.m4a` (its record is ignored once the file is gone) and play the track again. A failed fetch is logged only at debug level; turn on debug logging for the provider if you need to see why.
+**Covers.** A cover is fetched in the background in two cases: right after a track is stored, and when a track is played from the cache while its album folder has no `cover.jpg`. The second case gives a cover to tracks cached before covers existed and to albums whose first fetch failed, on the next play. It costs one track lookup (an Apple API call, throttled) and one image fetch per album, and never delays the audio. An album that still has no cover is looked at again once an hour at most, so an album without artwork does not ask on every play; an album that has a cover is not looked at again until MA restarts. This memory of attempts is in RAM only. A failed fetch is logged only at debug level; turn on debug logging for the provider if you need to see why. To redo a cover, delete the `cover.jpg` and play a track of the album (after a restart, or an hour after the last look).
 
 **If a cached file stops playing:** MA drops a cached file by itself when Apple's key id for the track changes or the file's size differs from its record, then downloads it again on the next play. Deleting one file by hand is also fine; its record is ignored when the file is missing.
 
@@ -292,21 +282,23 @@ Never print `settings.json` itself: it contains MA's encryption key.
 
 - The backup command (as a dry run, writing to `/dev/null`).
 - The smoke test, in a throwaway container from the production image.
-- The verification steps and the settings edit.
+- The verification steps.
 - Real playback: three tracks cached on first play, and a repeat play of a cached track opened the cached file with no write activity.
-- Procedure A with the deploy script from the repository (2026-11-23): the smoke test passed on the production image, the safety-check dry run passed, the deploy copied the six files and compared each byte for byte with the checkout, and MA restarted and loaded the provider with the cache on. The setting survived the restart, the new label and description are in the container's translations, and the cache folder was consistent afterwards (31 tracks, each with a record of the same size, no leftover `.part` file). That folder was emptied by hand later the same evening, which is what exposed the index-folder bug below.
+- Procedure A with the deploy script from the repository (2026-11-23): the smoke test passed on the production image, the safety-check dry run passed, the deploy copied the six files and compared each byte for byte with the checkout, and MA restarted and loaded the provider with the cache on. That version had the folder as a field in the provider's settings, which survived the restart; the cache folder was consistent afterwards (31 tracks, each with a record of the same size, no leftover `.part` file). That folder was emptied by hand later the same evening, which is what exposed the index-folder bug below.
 - **The index-folder bug (2026-11-23).** After the folder was emptied while MA ran, the production log showed `Could not start storing audio ... .ma-audio-cache/<id>.part: No such file or directory` and nothing was kept; the host and container were confirmed to see the same folder, and the container could write to it. The cause was reproduced by a unit test that fails on the old code with that same message and passes on the fix. The fix was deployed with Procedure A and MA restarted.
 - **Replays of cached tracks.** On the build deployed at 20:25: a replay read both the cached file and its record 0.5 s after the play request, with no download and no new file (seen from their last-read times, the first read after a write). On the current build (deployed 22:52): the watcher saw the cached `.m4a` opened with no `.part` created, and no new file.
-- **Album covers (2026-11-23).** Tested by six unit tests (the cover is written next to the track, one fetch per album, no artwork, not a JPEG, a failed fetch costing nothing, and a slow fetch not holding up the end of the track) and by steps 1 and 7 of the smoke test on the production image. On the live server, a track from a new album was stored at 22:53:21 and its `cover.jpg` appeared 0.3 s later: a real 1000 x 1000 JPEG of about 339 KB, written through a `cover.jpg.part` that was then renamed, none left behind. The tracks cached before covers existed got none, as described in section 8.
+- **The restructure (2026-11-23).** The branch was reshaped so that it adds two files and changes two lines of one upstream file (section 2), and the folder moved from a settings field to the environment variable. Done and checked: all 200 Apple Music unit tests pass; the smoke test passes (all seven steps) with the whole provider folder mounted over the production image's; the single commit replays onto the current upstream `dev` with no conflicts (the previous version conflicted in four files). Deployed by recreating the container with the variable (`docker compose up -d --no-start`) and running the deploy script: it copied and byte-checked all 23 provider files plus `en.json`, and afterwards the five files the old version had changed (`constants.py`, `provider.py`, `streaming.py`, `strings.json`, `en.json`) were identical to upstream's. MA started with `Keeping the audio of played tracks in /music-cache`, the variable is in the container, and the existing cache (5 tracks, 3 covers) was untouched. A real cache hit and a real new cover on this build are listed under "Not run" until they have been seen.
+- **Album covers (2026-11-23).** Tested by six unit tests (the cover is written next to the track, one fetch per album, no artwork, not a JPEG, a failed fetch costing nothing, and a slow fetch not holding up the end of the track) and by steps 1 and 7 of the smoke test on the production image. On the live server, a track from a new album was stored at 22:53:21 and its `cover.jpg` appeared 0.3 s later: a real 1000 x 1000 JPEG of about 339 KB, written through a `cover.jpg.part` that was then renamed, none left behind. The tracks cached before covers existed got none at that point; the backfill below is what gives them one.
 
-**Not run:** Procedure B on a newer MA version (the rebase step in particular), the rollback and restore commands, and the UI path in section 8. A failed cover fetch and two tracks of one new album finishing at the same moment have only been tested with mocks, not on the live server.
+- **Covers for tracks played from the cache (2026-11-23).** Tested by four more unit tests (the cover is fetched for an album that lacks it, an album with a cover is not asked about again, an album that could not be found is retried only after an hour, and the play of a cached track starts the check; the last one fails when the hook is removed) and by step 8 of the smoke test on the production image. Deployed with the deploy script (all 23 provider files byte-checked, MA restarted, cache on). Seeing it on real tracks is listed under "Not run" until it has been seen.
+
+**Not run:** Procedure B on a newer MA version (the rebase step in particular, and the cache on `dev`'s or any newer streaming code: it applies cleanly to `dev`, but the tests could not be run there because the project's Python environment had the older `music_assistant_models`), the rollback and restore commands, and the compose-edit path in section 8 (it was used once, for the restructure). The cover backfill on real tracks (two kept tracks whose albums have no cover are the test), a failed cover fetch, and two tracks of one new album finishing at the same moment have only been tested with mocks, not on the live server.
 
 **Known gaps and open risks:**
 
-- **The code is not part of the image.** It lives in the container's writable layer, so a recreate silently turns the cache off until Procedure A is run (MA still works, the setting stays). A permanent fix is a bind mount of the six files in `docker-compose.yml` or a small custom image. Neither is set up. A bind mount would also pin the old code over a future image, so it needs the same version checks as the deploy script.
-- **The setting could be dropped.** If MA runs on stock code (after a recreate, before Procedure A) and rewrites its settings, it may remove the `audio_cache_path` key. Not observed, not ruled out. Always run the settings check in Procedure A, step 7.
+- **The code is not part of the image.** It lives in the container's writable layer, so a recreate silently turns the cache off until Procedure A is run (MA still works, the variable stays in the compose file). A permanent fix is now small: bind-mount the three files the branch adds or changes (`__init__.py`, `audio_cache.py`, `cached_provider.py`) in `docker-compose.yml`, or build a small custom image. Neither is set up. A bind mount would also pin the old `__init__.py` over a future image, so it needs the same version checks as the deploy script.
 - **Real-Apple tests are limited to first plays and repeat plays of a handful of tracks.** Skipping partway through a download and seeking into a not-yet-cached track were tested with unit tests and a synthetic encrypted file against the production image, not with real Apple Music tracks.
 - **A missing cover leaves no visible error.** A failed cover fetch is only logged at debug level, and it is not retried until another track of that album is stored. The cover depends on MA's own image functions, which a new MA version may change (Procedure B, step 3 lists what to check).
 - **Account limits are unchanged.** Apple allows one concurrent stream, and the provider still enforces that. A cache hit also still asks Apple for a licence key (a small request), so playback needs a working subscription.
 - **A restart logs `Error unloading player` for Chromecast players** (a timeout in the Chromecast teardown while MA shuts down). Seen once, at the 2026-11-23 restart; it comes from the Chromecast provider, not from the cache.
-- **Unverified:** how the settings page shows the new field (its description now also mentions the album cover) after the translations file is deployed; the rollback leaving a stale `audio_cache_path` in the settings; the restore command in section 7.
+- **Unverified:** the rollback to stock code with the variable still set and the old `audio_cache_path` value still in the data volume; the restore command in section 7.
