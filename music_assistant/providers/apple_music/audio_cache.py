@@ -1,7 +1,8 @@
-"""Local copies of the encrypted audio files of Apple Music tracks."""
+"""Local copies of clear (still-compressed) AAC files of Apple Music tracks."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import math
 import os
@@ -62,14 +63,16 @@ class AudioDownload:
 
     url: str
     key_id: str
+    decryption_key: str = ""
 
 
 class AudioCache:
     """
-    The encrypted audio files of tracks played before, in a folder tree by artist and album.
+    Clear (still-compressed) AAC files of tracks played before, in a folder tree by artist and album.
 
-    The files are kept exactly as Apple serves them, so they stay encrypted: playing one asks
-    Apple for the key of the account again, and without that key the file is not audio.
+    The first play downloads Apple's encrypted bytes (so the player can decrypt live), then
+    ffmpeg rewrites the finished file to clear M4A with ``-c:a copy``. Later plays use that
+    clear file and need no Widevine key.
     """
 
     def __init__(self, provider: AppleMusicProvider, root: str) -> None:
@@ -117,6 +120,48 @@ class AudioCache:
         :param item_id: The provider item id of the track.
         :param key_id: The key id of the current stream of the track, as hex.
         """
+        resolved = await self._resolve_entry(item_id)
+        if resolved is None:
+            return None
+        entry, path, size = resolved
+        if entry.get("key_id") != key_id or entry.get("size") != size:
+            self.logger.debug("Dropping the cached audio of %s, it no longer matches", item_id)
+            await self._remove(path)
+            await self._remove(self._entry_path(item_id))
+            return None
+        return path
+
+    async def lookup_clear(self, item_id: str) -> str | None:
+        """
+        Return the path of a clear cached M4A for a track, if one is kept.
+
+        Used to play without contacting Apple: no key id is required, only a valid
+        clear file whose size still matches the index.
+
+        :param item_id: The provider item id of the track.
+        """
+        resolved = await self._resolve_entry(item_id)
+        if resolved is None:
+            return None
+        entry, path, size = resolved
+        if not entry.get("clear") or entry.get("size") != size:
+            return None
+        return path
+
+    async def is_clear(self, item_id: str) -> bool:
+        """
+        Return whether the cached file of a track is a clear (unencrypted) M4A.
+
+        :param item_id: The provider item id of the track.
+        """
+        if (entry := await self._read_entry(item_id)) is None:
+            return False
+        return bool(entry.get("clear"))
+
+    async def _resolve_entry(
+        self, item_id: str
+    ) -> tuple[dict[str, Any], str, int] | None:
+        """Return index entry, real path and on-disk size when the file is still there."""
         if not _SAFE_ITEM_ID.match(item_id):
             return None
         if (entry := await self._read_entry(item_id)) is None:
@@ -128,24 +173,19 @@ class AudioCache:
             size = (await aiofiles.os.stat(path)).st_size
         except OSError:
             return None
-        if entry.get("key_id") != key_id or entry.get("size") != size:
-            self.logger.debug("Dropping the cached audio of %s, it no longer matches", item_id)
-            await self._remove(path)
-            await self._remove(self._entry_path(item_id))
-            return None
-        return path
+        return entry, path, size
 
     async def stream_and_store(
         self, item_id: str, download: AudioDownload, track: Track | None
     ) -> AsyncGenerator[bytes]:
         """
-        Yield the encrypted file of a track as Apple serves it, and keep a copy once it is whole.
+        Yield the encrypted file as Apple serves it (for live playback with the key),
+        then store a clear M4A copy once the download is whole.
 
-        A download that does not reach its end, because the track was skipped or the
-        connection failed, leaves nothing behind.
+        A download that does not reach its end leaves nothing behind.
 
         :param item_id: The provider item id of the track.
-        :param download: Where the file is, and the key id it is encrypted for.
+        :param download: URL, key id, and optional decryption key for the clear rewrite.
         :param track: The track, for the name of the file; None when it could not be fetched.
         """
         fill_id = f"{self.root}\0{item_id}"
@@ -176,14 +216,85 @@ class AudioCache:
             if sink is not None:
                 with contextlib.suppress(OSError):
                     await sink.close()
-                # the player may stop reading right after the last chunk, so a download is
-                # also whole when it holds everything the server announced
+                # ensure the part is fully on disk before ffmpeg reads it
+                with contextlib.suppress(OSError):
+                    fd = os.open(part_path, os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
                 whole = received > 0 and (
                     received == expected or (expected is None and reached_end)
                 )
+                part_size = 0
+                with contextlib.suppress(OSError):
+                    part_size = (await aiofiles.os.stat(part_path)).st_size
+                self.logger.info(
+                    "audio cache download done item_id=%s whole=%s received=%s expected=%s "
+                    "part_size=%s reached_end=%s key_len=%s key_fp=%s",
+                    item_id,
+                    whole,
+                    received,
+                    expected,
+                    part_size,
+                    reached_end,
+                    len(download.decryption_key or ""),
+                    _key_fingerprint(download.decryption_key),
+                )
                 if whole:
-                    await self._store(item_id, download.key_id, part_path, received, track)
+                    store_path = part_path
+                    store_size = received
+                    is_clear = False
+                    if download.decryption_key:
+                        # must end in a real media extension or ffmpeg cannot pick a muxer
+                        clear_path = f"{part_path}.clear.m4a"
+                        t0 = time.monotonic()
+                        ok = await self._decrypt_part_to_clear(
+                            part_path, clear_path, download.decryption_key
+                        )
+                        decrypt_ms = int((time.monotonic() - t0) * 1000)
+                        if ok:
+                            await self._remove(part_path)
+                            store_path = clear_path
+                            is_clear = True
+                            try:
+                                store_size = (await aiofiles.os.stat(clear_path)).st_size
+                            except OSError:
+                                store_size = received
+                            self.logger.info(
+                                "audio cache clear OK item_id=%s decrypt_ms=%s clear_size=%s",
+                                item_id,
+                                decrypt_ms,
+                                store_size,
+                            )
+                        else:
+                            await self._remove(clear_path)
+                            self.logger.warning(
+                                "Could not decrypt cached audio of %s after %sms; "
+                                "keeping encrypted copy",
+                                item_id,
+                                decrypt_ms,
+                            )
+                    else:
+                        self.logger.warning(
+                            "audio cache has no decryption_key for item_id=%s; storing encrypted",
+                            item_id,
+                        )
+                    await self._store(
+                        item_id,
+                        download.key_id,
+                        store_path,
+                        store_size,
+                        track,
+                        clear=is_clear,
+                    )
                 else:
+                    self.logger.info(
+                        "audio cache incomplete item_id=%s received=%s expected=%s; dropped",
+                        item_id,
+                        received,
+                        expected,
+                    )
                     await self._remove(part_path)
             if claimed:
                 _DOWNLOADING.discard(fill_id)
@@ -208,8 +319,95 @@ class AudioCache:
             self._backfill_cover, item_id, album_dir, task_id=f"apple_music.cover.{album_dir}"
         )
 
+    async def _decrypt_part_to_clear(
+        self, encrypted_path: str, clear_path: str, decryption_key: str
+    ) -> bool:
+        """
+        Rewrite an encrypted download to a clear M4A with ffmpeg ``-c:a copy``.
+
+        :param encrypted_path: Path of the finished encrypted part file.
+        :param clear_path: Path to write the clear file to.
+        :param decryption_key: Widevine content key as hex.
+        :return: True when the clear file was written successfully.
+        """
+        enc_size = 0
+        with contextlib.suppress(OSError):
+            enc_size = (await aiofiles.os.stat(encrypted_path)).st_size
+        args = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-decryption_key",
+            decryption_key,
+            "-i",
+            encrypted_path,
+            "-c:a",
+            "copy",
+            "-y",
+            clear_path,
+        ]
+        # log argv with the key redacted
+        safe_args = [
+            "<key>" if i and args[i - 1] == "-decryption_key" else a
+            for i, a in enumerate(args)
+        ]
+        self.logger.info(
+            "audio cache ffmpeg clear start enc=%s enc_size=%s clear=%s key_fp=%s argv=%s",
+            encrypted_path,
+            enc_size,
+            clear_path,
+            _key_fingerprint(decryption_key),
+            safe_args,
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout, stderr = await proc.communicate()
+            returncode = proc.returncode
+        except OSError as err:
+            self.logger.warning("ffmpeg clear rewrite failed to start: %s", err)
+            return False
+        err_text = (stderr or b"").decode(errors="replace").strip()
+        clear_size = 0
+        with contextlib.suppress(OSError):
+            clear_size = (await aiofiles.os.stat(clear_path)).st_size
+        if returncode != 0:
+            self.logger.warning(
+                "ffmpeg clear rewrite exited %s for %s clear_size=%s stderr=%s",
+                returncode,
+                encrypted_path,
+                clear_size,
+                err_text[:2000] if err_text else "<empty>",
+            )
+            return False
+        if clear_size <= 0:
+            self.logger.warning(
+                "ffmpeg clear rewrite produced empty file for %s stderr=%s",
+                encrypted_path,
+                err_text[:2000] if err_text else "<empty>",
+            )
+            return False
+        self.logger.info(
+            "audio cache ffmpeg clear done rc=0 clear_size=%s stderr=%s",
+            clear_size,
+            err_text[:500] if err_text else "<empty>",
+        )
+        return True
+
     async def _store(
-        self, item_id: str, key_id: str, part_path: str, size: int, track: Track | None
+        self,
+        item_id: str,
+        key_id: str,
+        part_path: str,
+        size: int,
+        track: Track | None,
+        *,
+        clear: bool = False,
     ) -> None:
         """Move a finished download to its place in the folder tree and record it."""
         relative = relative_file_path(track)
@@ -222,6 +420,7 @@ class AudioCache:
             "key_id": key_id,
             "path": relative,
             "size": size,
+            "clear": clear,
             "artist": track.artists[0].name if track and track.artists else None,
             "album": track.album.name if track and track.album else None,
             "title": track.name if track else None,
@@ -236,7 +435,13 @@ class AudioCache:
             await self._remove(part_path)
             await self._remove(target)
             return
-        self.logger.debug("Stored the audio of %s as %s", item_id, relative)
+        self.logger.info(
+            "Stored the audio of %s as %s clear=%s size=%s",
+            item_id,
+            relative,
+            clear,
+            size,
+        )
         if track is not None:
             # in the background, so a slow image server never holds up the end of the track
             album_dir = os.path.dirname(target)
@@ -376,3 +581,12 @@ def _safe_name(value: str, fallback: str) -> str:
     cleaned = _UNSAFE_CHARS.sub("_", unicodedata.normalize("NFC", value)).strip(" .")
     cleaned = cleaned.encode()[:MAX_NAME_BYTES].decode(errors="ignore").rstrip(" .")
     return cleaned or fallback
+
+
+def _key_fingerprint(key: str | None) -> str:
+    """Return a short non-secret fingerprint of a hex key for logs."""
+    if not key:
+        return "<none>"
+    if len(key) < 8:
+        return f"len={len(key)}"
+    return f"len={len(key)} head={key[:4]} tail={key[-4:]}"

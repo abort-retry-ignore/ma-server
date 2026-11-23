@@ -15,8 +15,10 @@ from contextlib import aclosing
 from typing import TYPE_CHECKING, Any
 
 from aiohttp.client_exceptions import ClientError
-from music_assistant_models.enums import StreamType
+from music_assistant_models.enums import ContentType, StreamType
 from music_assistant_models.errors import MusicAssistantError
+from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.streamdetails import StreamDetails
 
 from .audio_cache import ENV_AUDIO_CACHE_PATH, AudioCache, AudioDownload
 from .provider import AppleMusicProvider
@@ -27,7 +29,6 @@ if TYPE_CHECKING:
 
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
-    from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant import MusicAssistant
 
@@ -55,9 +56,31 @@ class CachingStreamingManager(AppleMusicStreamingManager):
         """
         Return StreamDetails for a single catalog or library track.
 
-        A track that is in the audio cache plays from its file. One that is not is fetched
-        here instead of by ffmpeg, so that a copy can be kept while it plays.
+        A clear file already in the audio cache is played locally with no Apple Music
+        contact. Otherwise the track is resolved with Apple as usual; a miss is fetched
+        here so a clear copy can be kept while it plays.
         """
+        # Clear hit: local file only — no webPlayback, license, or CDN.
+        if self.audio_cache is not None:
+            if cached_path := await self.audio_cache.lookup_clear(item_id):
+                self.audio_cache.start_missing_cover(item_id, cached_path)
+                self.logger.info(
+                    "audio cache clear hit item_id=%s path=%s (no Apple Music request)",
+                    item_id,
+                    cached_path,
+                )
+                return StreamDetails(
+                    item_id=item_id,
+                    provider=self.provider.instance_id,
+                    audio_format=AudioFormat(
+                        content_type=ContentType.MP4, codec_type=ContentType.AAC
+                    ),
+                    stream_type=StreamType.LOCAL_FILE,
+                    path=cached_path,
+                    can_seek=True,
+                    allow_seek=True,
+                )
+
         details = await super().get_stream_details(item_id)
         key_id = self._key_ids.pop(item_id, None)
         if (
@@ -70,16 +93,21 @@ class CachingStreamingManager(AppleMusicStreamingManager):
         ):
             return details
         if cached_path := await self.audio_cache.lookup(item_id, key_id):
+            # legacy encrypted cache entry: keep the key on the details
             self.audio_cache.start_missing_cover(item_id, cached_path)
             return dataclasses.replace(details, path=cached_path)
-        # the file then arrives over a pipe, which seeks by reading on
+        # miss: stream encrypted bytes with the key for live play, store clear after
         return dataclasses.replace(
             details,
             stream_type=StreamType.CUSTOM,
             path=None,
             decryption_key=None,
             extra_input_args=["-decryption_key", details.decryption_key],
-            data=AudioDownload(url=details.path, key_id=key_id),
+            data=AudioDownload(
+                url=details.path,
+                key_id=key_id,
+                decryption_key=details.decryption_key or "",
+            ),
             can_seek=False,
         )
 
