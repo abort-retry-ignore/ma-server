@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .cached_provider import CachingAppleMusicProvider
 from .provider import AppleMusicProvider
 
 __all__ = ["AppleMusicProvider", "setup"]
@@ -33,4 +34,4 @@ async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
-    return AppleMusicProvider(mass, manifest, config)
+    return CachingAppleMusicProvider(mass, manifest, config)
