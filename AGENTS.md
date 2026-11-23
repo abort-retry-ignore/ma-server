@@ -5,6 +5,7 @@ Music Assistant is an async Python music library manager that connects to stream
 ## Behaviour
 
 - NEVER automatically reply on Github (PR's or Discussions) without explicit consent from the developer.
+- NEVER put personal details in the repository: not in code, comments, docs, tests, commit messages or PR text. This repository is public. That covers names, email addresses, usernames, host names, IP addresses and other local network details, home-directory and other host paths, provider instance ids, device identifiers, tokens, keys and passwords. Use placeholders (`<instance-id>`, `$STACK`) and generic examples instead. Before committing, scan the diff for such details.
 
 ## Usage policy
 
@@ -13,7 +14,6 @@ Music Assistant streams music to the user's own speakers. It is not a way to pro
 Flag it in review, and never write it yourself, when a change would:
 
 - expose a music service's own audio URL to anything outside the server (an API result, or a route that hands it to a caller)
-- decode protected audio outside without a valid subscription
 - call a service's API without throttling, or re-fetch what the cache already holds
 - walk a service's catalogue for one user action or background job: requests per album, track
   or page of an artist's discography or a service listing, so the count grows with the
@@ -21,7 +21,6 @@ Flag it in review, and never write it yourself, when a change would:
   all of its albums), and cap catalogue listings (an artist's albums stop at 100 releases).
   Paging through the user's own library, through the throttler, is fine
 - bypass a throttler, or keep sending requests while a service has asked us to wait
-- bypass a subscription tier, regional availability, or a service's stated concurrent-stream
   limit (see `max_concurrent_streams` in `music_assistant/models/music_provider.py`)
 
 Some guards in the codebase exist only for this reason and read as removable if you do not know
