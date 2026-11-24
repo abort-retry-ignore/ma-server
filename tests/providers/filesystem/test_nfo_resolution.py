@@ -401,6 +401,15 @@ def test_nfo_applies_cleanly_rejects_non_scalar_field() -> None:
     assert provider._nfo_applies_cleanly(non_scalar_genre, "album") is False
 
 
+@pytest.mark.parametrize("field", ["label", "copyright"])
+def test_nfo_applies_cleanly_rejects_non_scalar_album_metadata(field: str) -> None:
+    """Nested label and copyright fields cannot be applied as text."""
+    provider = _provider()
+    assert (
+        provider._nfo_applies_cleanly({"title": "Album", field: {"value": "bad"}}, "album") is False
+    )
+
+
 def test_nfo_applies_cleanly_accepts_repeated_genre_list() -> None:
     """A repeated <genre> element (xmltodict yields a list) is valid, split_items accepts it."""
     provider = _provider()

@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import ClientPayloadError
-from music_assistant_models.enums import ContentType, MediaType, StreamType
+from music_assistant_models.enums import ContentType, ExternalID, MediaType, StreamType
 from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import (
     Album,
@@ -27,7 +27,9 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 from music_assistant_models.streamdetails import StreamDetails
+from mutagen.mp4 import MP4
 
+from music_assistant.helpers.tags import async_parse_tags
 from music_assistant.providers.apple_music import audio_cache as cache_module
 from music_assistant.providers.apple_music import setup
 from music_assistant.providers.apple_music.audio_cache import (
@@ -38,6 +40,7 @@ from music_assistant.providers.apple_music.audio_cache import (
     AudioDownload,
     relative_file_path,
 )
+from music_assistant.providers.apple_music.cache_library import CACHE_COPY_GRACE_SECONDS
 from music_assistant.providers.apple_music.cached_provider import (
     CachingAppleMusicProvider,
     CachingStreamingManager,
@@ -644,7 +647,7 @@ async def test_a_track_not_in_the_cache_is_fetched_by_us_and_decrypted_by_ffmpeg
 
     assert details.stream_type == StreamType.CUSTOM
     assert details.extra_input_args == ["-decryption_key", "abc123"]
-    assert details.data == AudioDownload(url=CTRP_URL, key_id=KEY_ID)
+    assert details.data == AudioDownload(url=CTRP_URL, key_id=KEY_ID, decryption_key="abc123")
     assert details.path is None
     assert details.decryption_key is None
     assert (details.can_seek, details.allow_seek) == (False, True)
@@ -786,6 +789,214 @@ async def test_a_key_function_without_a_key_id_still_plays_without_the_cache(
     assert details.path == CTRP_URL
     assert details.decryption_key == "abc123"
     assert manager._key_ids == {}
+
+
+async def test_publish_clear_cache_tags_and_indexes_without_replacing_files(tmp_path: Path) -> None:
+    """Publish tagged audio, preserve an existing file, and keep the cache usable."""
+    root = tmp_path / "cache"
+    library = tmp_path / "library"
+    provider = _provider()
+    provider.mass.music.providers = []
+    cache = AudioCache(provider, str(root), str(library))
+    assert await cache.setup()
+    part = root / AUDIO_CACHE_INDEX_DIR / "1.part"
+    shutil.copyfile(Path("tests/fixtures/MyArtist - MyTitle.m4a"), part)
+    original_size = part.stat().st_size
+    occupied = library / "Artist" / "Album" / "03 Song.m4a"
+    occupied.parent.mkdir(parents=True)
+    occupied.write_bytes(b"my existing music")
+
+    await cache._store("1", KEY_ID, str(part), original_size, _track(), clear=True)
+    await _settle(cache)
+
+    published = library / "Artist" / "Album" / "03 Song [1].m4a"
+    assert occupied.read_bytes() == b"my existing music"
+    assert published.is_file()
+    tags: Any = MP4(published).tags  # type: ignore[no-untyped-call]
+    assert tags is not None
+    assert tags["©nam"] == ["Song"]
+    assert tags["©ART"] == ["Artist"]
+    assert tags["©alb"] == ["Album"]
+    assert tags["trkn"] == [(3, 0)]
+    assert await cache.lookup_clear("1") == str(published.resolve())
+    assert (root / "Artist" / "Album" / "03 Song.m4a").is_file()
+    assert cache.library is not None
+    await cache.library.publish_all()
+    assert len(list(published.parent.glob("*.m4a"))) == 2
+    published.unlink()
+    assert await cache.lookup_clear("1") == str(
+        (root / "Artist" / "Album" / "03 Song.m4a").resolve()
+    )
+
+
+async def test_published_version_and_isrc_are_readable_by_local_provider(tmp_path: Path) -> None:
+    """The local tag parser sees recording identity and version in published audio."""
+    root = tmp_path / "cache"
+    library = tmp_path / "library"
+    provider = _provider()
+    provider.mass.music.providers = []
+    cache = AudioCache(provider, str(root), str(library))
+    assert await cache.setup()
+    part = root / AUDIO_CACHE_INDEX_DIR / "1.part"
+    shutil.copyfile(Path("tests/fixtures/MyArtist - MyTitle.m4a"), part)
+    track = _track()
+    track.version = "Live"
+    track.external_ids.add((ExternalID.ISRC, "USRC17607839"))
+
+    await cache._store("1", KEY_ID, str(part), part.stat().st_size, track, clear=True)
+    await _settle(cache)
+
+    published = await cache.lookup_clear("1")
+    assert published is not None
+    tags = await async_parse_tags(published)
+    assert tags.title == "Song (Live)"
+    assert tags.album == "Album"
+    assert tags.artists == ("Artist",)
+    assert "USRC17607839" in tags.isrc
+
+
+@pytest.mark.parametrize("modified", ["none", "source", "destination"])
+async def test_old_cache_copy_is_removed_only_when_unchanged(tmp_path: Path, modified: str) -> None:
+    """The move finishes after old stream details expire, without removing changed files."""
+    root = tmp_path / "cache"
+    library = tmp_path / "library"
+    provider = _provider()
+    provider.mass.music.providers = []
+    cache = AudioCache(provider, str(root), str(library))
+    assert await cache.setup()
+    part = root / AUDIO_CACHE_INDEX_DIR / "1.part"
+    shutil.copyfile(Path("tests/fixtures/MyArtist - MyTitle.m4a"), part)
+    await cache._store("1", KEY_ID, str(part), part.stat().st_size, _track(), clear=True)
+    await _settle(cache)
+    original = root / "Artist" / "Album" / "03 Song.m4a"
+    if modified == "source":
+        original.write_bytes(b"changed by user")
+    elif modified == "destination":
+        published = library / "Artist" / "Album" / "03 Song.m4a"
+        with published.open("r+b") as file:
+            file.write(b"x")
+    entry = await cache._read_entry("1")
+    assert entry is not None
+    entry["published_at"] = time.time() - CACHE_COPY_GRACE_SECONDS - 1
+    await cache._write_entry("1", entry)
+    assert cache.library is not None
+
+    await cache.library._discard_cache_copy("1")
+
+    assert original.exists() is (modified != "none")
+    assert await cache.lookup_clear("1") is not None
+
+
+async def test_publication_links_the_exact_streaming_mapping(tmp_path: Path) -> None:
+    """The local provider receives the cached track's original Apple Music identity."""
+    root = tmp_path / "cache"
+    library = tmp_path / "library"
+    provider = _provider()
+    provider.domain = "apple_music"
+    local = MagicMock(domain="filesystem_local", instance_id="filesystem_local--test")
+    local.available = True
+    local.base_path = str(library)
+    local_track = _track(item_id="local/path")
+    local_track.provider_mappings.clear()
+    local.get_track = AsyncMock(return_value=local_track)
+    provider.mass.music.providers = [local]
+    provider.mass.music.tracks.get_library_item_by_prov_id = AsyncMock(return_value=None)
+    provider.mass.music.tracks.add_item_to_library = AsyncMock()
+    cache = AudioCache(provider, str(root), str(library))
+    assert await cache.setup()
+    part = root / AUDIO_CACHE_INDEX_DIR / "1.part"
+    shutil.copyfile(Path("tests/fixtures/MyArtist - MyTitle.m4a"), part)
+
+    await cache._store("1", KEY_ID, str(part), part.stat().st_size, _track(), clear=True)
+    await _settle(cache)
+
+    local.get_track.assert_awaited_once_with(os.path.join("Artist", "Album", "03 Song.m4a"))
+    assert any(
+        mapping.item_id == "1" and mapping.provider_instance == INSTANCE
+        for mapping in local_track.provider_mappings
+    )
+    provider.mass.music.tracks.add_item_to_library.assert_awaited_once_with(local_track)
+
+
+async def test_new_cover_refreshes_the_local_album(tmp_path: Path) -> None:
+    """A cover downloaded after the track is indexed is added to the local album."""
+    root = tmp_path / "cache"
+    library = tmp_path / "library"
+    provider = _provider(cover=COVER)
+    provider.domain = "apple_music"
+    local = MagicMock(domain="filesystem_local", instance_id="filesystem_local--test")
+    local.available = True
+    local.base_path = str(library)
+    local_track = _track(item_id="local/path", album_artist="Artist")
+    local.get_track = AsyncMock(return_value=local_track)
+    local.cache.delete = AsyncMock()
+    provider.mass.music.providers = [local]
+    provider.mass.music.tracks.get_library_item_by_prov_id = AsyncMock(return_value=None)
+    provider.mass.music.tracks.add_item_to_library = AsyncMock()
+    provider.mass.music.albums.add_item_to_library = AsyncMock()
+    cache = AudioCache(provider, str(root), str(library))
+    assert await cache.setup()
+    part = root / AUDIO_CACHE_INDEX_DIR / "1.part"
+    shutil.copyfile(Path("tests/fixtures/MyArtist - MyTitle.m4a"), part)
+
+    await cache._store("1", KEY_ID, str(part), part.stat().st_size, _track(), clear=True)
+    await _settle(cache)
+
+    assert (library / "Artist" / "Album" / "cover.jpg").read_bytes() == COVER
+    assert local.cache.delete.await_count == 4
+    provider.mass.music.albums.add_item_to_library.assert_awaited_once_with(local_track.album)
+    assert local.get_track.await_count == 2
+
+
+async def test_invalid_cached_file_is_not_published_or_lost(tmp_path: Path) -> None:
+    """A tagging error leaves the existing cache entry and bytes untouched."""
+    root = tmp_path / "cache"
+    library = tmp_path / "library"
+    provider = _provider()
+    provider.mass.music.providers = []
+    cache = AudioCache(provider, str(root), str(library))
+    assert await cache.setup()
+    part = root / AUDIO_CACHE_INDEX_DIR / "1.part"
+    part.write_bytes(DATA)
+
+    await cache._store("1", KEY_ID, str(part), len(DATA), _track(), clear=True)
+    await _settle(cache)
+
+    original = root / "Artist" / "Album" / "03 Song.m4a"
+    assert original.read_bytes() == DATA
+    assert await cache.lookup_clear("1") == str(original.resolve())
+    assert not list(library.rglob("*.m4a"))
+
+
+async def test_backfill_existing_clear_entry_and_ignore_encrypted(tmp_path: Path) -> None:
+    """Backfill uses the stored metadata and does not publish encrypted audio."""
+    root = tmp_path / "cache"
+    library = tmp_path / "library"
+    provider = _provider()
+    provider.mass.music.providers = []
+    provider.mass.music.tracks.get_library_item_by_prov_id = AsyncMock(return_value=None)
+    cache = AudioCache(provider, str(root))
+    assert await cache.setup()
+    part = root / AUDIO_CACHE_INDEX_DIR / "1.part"
+    shutil.copyfile(Path("tests/fixtures/MyArtist - MyTitle.m4a"), part)
+    await cache._store("1", KEY_ID, str(part), part.stat().st_size, _track(), clear=True)
+    await _settle(cache)
+    part.write_bytes(DATA)
+    await cache._store("2", KEY_ID, str(part), len(DATA), _track(item_id="2"), clear=False)
+    await _settle(cache)
+    cache = AudioCache(provider, str(root), str(library))
+    assert cache.library is not None
+
+    await cache.library.publish_all()
+
+    published = library / "Artist" / "Album" / "03 Song.m4a"
+    tags: Any = MP4(published).tags  # type: ignore[no-untyped-call]
+    assert tags is not None
+    assert tags["©nam"] == ["Song"]
+    assert tags["trkn"] == [(3, 0)]
+    assert await cache.lookup_clear("1") == str(published.resolve())
+    assert len(list(library.rglob("*.m4a"))) == 1
+    assert await cache.lookup("2", KEY_ID) is not None
 
 
 async def test_the_audio_cache_is_opened_when_a_folder_is_set(

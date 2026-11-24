@@ -32,6 +32,10 @@ def parse_album_nfo(album: Album, nfo_album: dict[Any, Any], source: str | None 
             album.artists[0].mbid = mb_artist_id
     if description := nfo_album.get("review"):
         album.metadata.description = description
+    if label := nfo_album.get("label"):
+        album.metadata.label = label
+    if copyright_text := nfo_album.get("copyright"):
+        album.metadata.copyright = copyright_text
     if year := nfo_album.get("year"):
         album.year = int(year)
     if genre := nfo_album.get("genre"):

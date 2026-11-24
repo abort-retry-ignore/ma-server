@@ -183,6 +183,8 @@ _ALBUM_NFO_FIELDS = (
     "name",
     "sortname",
     "review",
+    "label",
+    "copyright",
     "year",
     "genre",
     "musicbrainzalbumid",
@@ -2571,6 +2573,14 @@ class LocalFileSystemProvider(MusicProvider):
                 )
         elif syn_lyrics := tags.synchronized_lyrics:
             track.metadata.lrc_lyrics = lyrics.convert_to_lrc_lyrics(syn_lyrics)
+
+        if not track.metadata.lyrics:
+            lyrics_path = f"{file_item.relative_path.removesuffix(file_item.ext)}lyrics.txt"
+            if await self.exists(lyrics_path):
+                try:
+                    track.metadata.lyrics = (await self._read_file(lyrics_path)).decode("utf-8")
+                except (OSError, UnicodeDecodeError) as err:
+                    self.logger.warning("Failed to read lyrics file %s: %s", lyrics_path, err)
 
         return track
 

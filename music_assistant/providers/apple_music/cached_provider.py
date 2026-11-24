@@ -8,10 +8,11 @@ moving to a newer Music Assistant version a small job.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import inspect
 import os
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 from typing import TYPE_CHECKING, Any
 
 from aiohttp.client_exceptions import ClientError
@@ -21,6 +22,7 @@ from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.streamdetails import StreamDetails
 
 from .audio_cache import ENV_AUDIO_CACHE_PATH, AudioCache, AudioDownload
+from .cache_library import ENV_AUDIO_LIBRARY_PATH
 from .provider import AppleMusicProvider
 from .streaming import AppleMusicStreamingManager
 
@@ -47,7 +49,8 @@ class CachingStreamingManager(AppleMusicStreamingManager):
         await super().initialize()
         if not (cache_path := os.environ.get(ENV_AUDIO_CACHE_PATH, "").strip()):
             return
-        audio_cache = AudioCache(self.provider, cache_path)
+        library_path = os.environ.get(ENV_AUDIO_LIBRARY_PATH, "").strip() or None
+        audio_cache = AudioCache(self.provider, cache_path, library_path)
         if await audio_cache.setup():
             self.audio_cache = audio_cache
             self.logger.info("Keeping the audio of played tracks in %s", cache_path)
@@ -63,6 +66,12 @@ class CachingStreamingManager(AppleMusicStreamingManager):
         # Clear hit: local file only — no webPlayback, license, or CDN.
         if self.audio_cache is not None:
             if cached_path := await self.audio_cache.lookup_clear(item_id):
+                if self.audio_cache.library is not None:
+                    self.provider.mass.create_task(
+                        self.audio_cache.library.publish,
+                        item_id,
+                        task_id=f"apple_music.publish.{item_id}",
+                    )
                 self.audio_cache.start_missing_cover(item_id, cached_path)
                 self.logger.info(
                     "audio cache clear hit item_id=%s path=%s (no Apple Music request)",
@@ -155,6 +164,15 @@ class CachingAppleMusicProvider(AppleMusicProvider):
         self.caching_streams = CachingStreamingManager(self)
         self.streaming_manager = self.caching_streams
 
+    async def loaded_in_mass(self) -> None:
+        """Publish existing cache entries after the provider has loaded."""
+        await super().loaded_in_mass()
+        if self.caching_streams.audio_cache and self.caching_streams.audio_cache.library:
+            self.mass.create_task(
+                self._publish_cached_audio,
+                task_id=f"{self.instance_id}.publish_cached_audio",
+            )
+
     async def get_audio_stream(
         self, streamdetails: StreamDetails, seek_position: int = 0
     ) -> AsyncGenerator[bytes]:
@@ -171,3 +189,13 @@ class CachingAppleMusicProvider(AppleMusicProvider):
         async with aclosing(self.caching_streams.stream_track_and_store(streamdetails)) as stream:
             async for chunk in stream:
                 yield chunk
+
+    async def _publish_cached_audio(self) -> None:
+        """Publish the cache after the filesystem provider has had time to load."""
+        with suppress(TimeoutError):
+            await asyncio.wait_for(
+                self.mass.get_provider_ready_event("filesystem_local").wait(), 30
+            )
+        while self.caching_streams.audio_cache and self.caching_streams.audio_cache.library:
+            await self.caching_streams.audio_cache.library.publish_all()
+            await asyncio.sleep(3600)

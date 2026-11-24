@@ -22,6 +22,7 @@ from music_assistant_models.errors import MusicAssistantError
 
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import async_json_dumps, async_json_loads
+from music_assistant.providers.apple_music.cache_library import CacheLibrary
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -75,17 +76,21 @@ class AudioCache:
     clear file and need no Widevine key.
     """
 
-    def __init__(self, provider: AppleMusicProvider, root: str) -> None:
+    def __init__(
+        self, provider: AppleMusicProvider, root: str, library_root: str | None = None
+    ) -> None:
         """
         Initialize the cache.
 
         :param provider: The provider the files belong to.
         :param root: The folder the files are kept in.
+        :param library_root: Optional destination for tagged local library files.
         """
         self.provider = provider
         self.logger = provider.logger
         self.root = root
         self._index_dir = os.path.join(root, AUDIO_CACHE_INDEX_DIR)
+        self.library = CacheLibrary(self, library_root) if library_root else None
 
     async def setup(self) -> bool:
         """
@@ -126,7 +131,8 @@ class AudioCache:
         entry, path, size = resolved
         if entry.get("key_id") != key_id or entry.get("size") != size:
             self.logger.debug("Dropping the cached audio of %s, it no longer matches", item_id)
-            await self._remove(path)
+            if entry.get("location") != "library":
+                await self._remove(path)
             await self._remove(self._entry_path(item_id))
             return None
         return path
@@ -158,29 +164,11 @@ class AudioCache:
             return False
         return bool(entry.get("clear"))
 
-    async def _resolve_entry(
-        self, item_id: str
-    ) -> tuple[dict[str, Any], str, int] | None:
-        """Return index entry, real path and on-disk size when the file is still there."""
-        if not _SAFE_ITEM_ID.match(item_id):
-            return None
-        if (entry := await self._read_entry(item_id)) is None:
-            return None
-        path = os.path.realpath(os.path.join(self.root, str(entry.get("path", ""))))
-        if not path.startswith(os.path.realpath(self.root) + os.sep):
-            return None
-        try:
-            size = (await aiofiles.os.stat(path)).st_size
-        except OSError:
-            return None
-        return entry, path, size
-
     async def stream_and_store(
         self, item_id: str, download: AudioDownload, track: Track | None
     ) -> AsyncGenerator[bytes]:
         """
-        Yield the encrypted file as Apple serves it (for live playback with the key),
-        then store a clear M4A copy once the download is whole.
+        Yield the encrypted file as Apple serves it, then keep a completed clear copy.
 
         A download that does not reach its end leaves nothing behind.
 
@@ -188,6 +176,7 @@ class AudioCache:
         :param download: URL, key id, and optional decryption key for the clear rewrite.
         :param track: The track, for the name of the file; None when it could not be fetched.
         """
+        # ruff: noqa: PLR0915
         fill_id = f"{self.root}\0{item_id}"
         part_path = os.path.join(self._index_dir, f"{item_id}.part")
         sink: AsyncBufferedIOBase | None = None
@@ -319,6 +308,40 @@ class AudioCache:
             self._backfill_cover, item_id, album_dir, task_id=f"apple_music.cover.{album_dir}"
         )
 
+    async def _resolve_entry(self, item_id: str) -> tuple[dict[str, Any], str, int] | None:
+        """Return index entry, real path and on-disk size when the file is still there."""
+        if not _SAFE_ITEM_ID.match(item_id):
+            return None
+        if (entry := await self._read_entry(item_id)) is None:
+            return None
+        if entry.get("location") == "library":
+            if self.library is not None:
+                path = os.path.realpath(os.path.join(self.library.root, str(entry.get("path", ""))))
+                if path.startswith(os.path.realpath(self.library.root) + os.sep):
+                    try:
+                        size = (await aiofiles.os.stat(path)).st_size
+                    except OSError:
+                        pass
+                    else:
+                        if size == entry.get("size"):
+                            return entry, path, size
+            entry = {
+                **entry,
+                "location": None,
+                "path": entry.get("cache_path"),
+                "size": entry.get("cache_size"),
+            }
+        elif entry.get("location") is not None:
+            return None
+        path = os.path.realpath(os.path.join(self.root, str(entry.get("path", ""))))
+        if not path.startswith(os.path.realpath(self.root) + os.sep):
+            return None
+        try:
+            size = (await aiofiles.os.stat(path)).st_size
+        except OSError:
+            return None
+        return entry, path, size
+
     async def _decrypt_part_to_clear(
         self, encrypted_path: str, clear_path: str, decryption_key: str
     ) -> bool:
@@ -349,8 +372,7 @@ class AudioCache:
         ]
         # log argv with the key redacted
         safe_args = [
-            "<key>" if i and args[i - 1] == "-decryption_key" else a
-            for i, a in enumerate(args)
+            "<key>" if i and args[i - 1] == "-decryption_key" else a for i, a in enumerate(args)
         ]
         self.logger.info(
             "audio cache ffmpeg clear start enc=%s enc_size=%s clear=%s key_fp=%s argv=%s",
@@ -442,11 +464,19 @@ class AudioCache:
             clear,
             size,
         )
+        if clear and self.library is not None:
+            await self.library.publish(item_id, track)
+            if resolved := await self._resolve_entry(item_id):
+                target = resolved[1]
         if track is not None:
             # in the background, so a slow image server never holds up the end of the track
             album_dir = os.path.dirname(target)
             self.provider.mass.create_task(
-                self._store_cover, track, album_dir, task_id=f"apple_music.cover.{album_dir}"
+                self._store_cover,
+                track,
+                album_dir,
+                item_id,
+                task_id=f"apple_music.cover.{album_dir}",
             )
 
     async def _open_part(self, part_path: str) -> AsyncBufferedIOBase | None:
@@ -516,9 +546,9 @@ class AudioCache:
         except (MusicAssistantError, ClientError, TimeoutError) as err:
             self.logger.debug("No track details to get the cover with: %s", err)
             return
-        await self._store_cover(track, album_dir)
+        await self._store_cover(track, album_dir, item_id)
 
-    async def _store_cover(self, track: Track, album_dir: str) -> None:
+    async def _store_cover(self, track: Track, album_dir: str, item_id: str | None = None) -> None:
         """Keep the cover of an album next to its tracks, unless it is there already."""
         cover = os.path.join(album_dir, AUDIO_CACHE_COVER_NAME)
         part = f"{cover}.part"
@@ -535,6 +565,8 @@ class AudioCache:
             await self._remove(part)
             return
         self.logger.debug("Stored the cover of %s as %s", track.name, cover)
+        if self.library is not None and item_id is not None:
+            await self.library.refresh_cover(item_id)
 
     async def _fetch_cover(self, track: Track) -> bytes | None:
         """Return the cover of a track as a JPEG, None when it has none."""

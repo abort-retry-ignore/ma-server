@@ -35,6 +35,8 @@ def test_parse_album_nfo() -> None:
         }
         assert res.artists[0].mbid == mb_artist
         assert res.metadata.description == "Test Description"
+        assert res.metadata.label == "Test Label"
+        assert res.metadata.copyright == "Test Copyright"
         assert res.year == 1967
         assert res.metadata.genres == {"Test Genre"}
 
@@ -47,6 +49,8 @@ def test_parse_album_nfo() -> None:
             "musicbrainzalbumid": mb_album,
             "musicbrainzalbumartistid": mb_artist,
             "review": "Test Description",
+            "label": "Test Label",
+            "copyright": "Test Copyright",
             "year": "1967",
             "genre": "Test Genre",
         },

@@ -139,7 +139,7 @@ from music_assistant.helpers.audio import (
     resample_pcm_audio,
     resolve_output_player_ids,
 )
-from music_assistant.helpers.compare import compare_item_ids
+from music_assistant.helpers.compare import compare_item_ids, compare_track, compare_version
 from music_assistant.helpers.dsp import ComplexFilter, filter_to_ffmpeg_params
 from music_assistant.helpers.ffmpeg import (
     FFMpeg,
@@ -179,6 +179,12 @@ if TYPE_CHECKING:
     from music_assistant.models.provider import Provider
 
 # ruff: noqa: PLR0915
+
+
+def _is_filesystem_provider(provider: Provider) -> bool:
+    """Return whether a provider serves files from local or mounted storage."""
+    return provider.domain in {"filesystem_local", "filesystem_smb", "filesystem_nfs"}
+
 
 # Seconds of PCM at the start of a track that are yielded straight to the player,
 # never held back for a crossfade.
@@ -3397,11 +3403,22 @@ class StreamsAudio:
             ):
                 # handle steering into user preferred providerinstance
                 preferred_providers = playback_user.provider_filter
+            if isinstance(media_item, Track):
+                try:
+                    media_item.provider_mappings.update(
+                        await self._playback_track_mappings(media_item)
+                    )
+                except Exception as err:
+                    self.logger.warning(
+                        "Unable to find local audio for %s: %s", media_item.name, err
+                    )
             candidates = self._get_streamdetail_candidates(
                 media_item.provider_mappings,
                 preferred_providers,
                 excluded_provider_instances,
             )
+            if isinstance(media_item, Track):
+                candidates.sort(key=lambda candidate: not _is_filesystem_provider(candidate[1]))
             streamdetails = await self._request_streamdetails(candidates, media_item.media_type)
 
             if not streamdetails:
@@ -3584,6 +3601,13 @@ class StreamsAudio:
                         queue_item.streamdetails = last_failed_streamdetails
             streamdetails = queue_item.streamdetails
             assert streamdetails is not None  # for type checking
+            if queue_item.media_item:
+                all_candidate_instances.update(
+                    provider.instance_id
+                    for mapping in queue_item.media_item.provider_mappings
+                    if mapping.available
+                    for provider in self._get_mapping_providers(mapping)
+                )
             remaining = max(deadline - loop.time(), 0)
             alternatives_left = bool(
                 all_candidate_instances - busy_instances - {streamdetails.provider}
@@ -3651,12 +3675,56 @@ class StreamsAudio:
                         final_pass = True
                 queue_item.streamdetails = None
             except AudioError:
+                provider = self.mass.get_provider(streamdetails.provider)
+                if (
+                    isinstance(queue_item.media_item, Track)
+                    and provider is not None
+                    and _is_filesystem_provider(provider)
+                    and all_candidate_instances - busy_instances - {streamdetails.provider}
+                ):
+                    self.logger.warning(
+                        "Local audio for %s failed; trying another source", queue_item.name
+                    )
+                    busy_instances.add(streamdetails.provider)
+                    queue_item.streamdetails = None
+                    continue
                 if last_capacity_error is None or final_pass:
                     raise
                 # a broken alternate must not turn a transient capacity miss into a hard
                 # failure: restore the blocked details and spend the rest of the budget there
                 queue_item.streamdetails = last_failed_streamdetails
                 final_pass = True
+
+    async def _playback_track_mappings(self, track: Track) -> set[ProviderMapping]:
+        """Find linked sources and matching local files without contacting a music service."""
+        local_providers = [
+            provider.instance_id
+            for provider in self.mass.music.providers
+            if provider.available and _is_filesystem_provider(provider)
+        ]
+        if not local_providers:
+            return set()
+        controller = self.mass.music.tracks
+        library_track = (
+            await controller.get_library_item(track.item_id)
+            if track.provider == "library"
+            else await controller.get_library_item_by_prov_mappings(track.provider_mappings)
+        )
+        linked = set(library_track.provider_mappings) if library_track else set()
+        if any(m.provider_instance in local_providers and m.available for m in linked):
+            return linked
+        matches = await controller.library_items(
+            search=track.name, provider=local_providers, summary=False, limit=100
+        )
+        linked.update(
+            mapping
+            for candidate in matches
+            if compare_version(track.version, candidate.version)
+            and compare_track(track, candidate, strict=True)
+            for mapping in candidate.provider_mappings
+            if mapping.provider_instance in local_providers and mapping.available
+        )
+        return linked
 
     def _get_streamdetail_candidates(
         self,

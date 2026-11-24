@@ -27,11 +27,19 @@ from music_assistant_models.errors import (
     ResourceTemporarilyUnavailable,
     RetriesExhausted,
 )
-from music_assistant_models.media_items import AudioFormat, ProviderMapping, SoundEffect
+from music_assistant_models.media_items import (
+    AudioFormat,
+    ItemMapping,
+    ProviderMapping,
+    SoundEffect,
+    Track,
+    UniqueList,
+)
 from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.controllers.streams.audio import StreamsAudio
+from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.models.music_provider import MusicProvider
 
 INSTANCE = "ai_radio--abc"
@@ -407,6 +415,131 @@ async def test_a_track_its_provider_cannot_serve_is_a_miss() -> None:
                 _mapping(INSTANCE, content_type=ContentType.FLAC), _mapping(OTHER_INSTANCE)
             )
         )
+
+
+def _music_queue_item(mapping: ProviderMapping) -> QueueItem:
+    """Return a provider track for local-first playback tests."""
+    artist = ItemMapping(
+        item_id="artist",
+        provider=mapping.provider_instance,
+        name="Artist",
+        media_type=MediaType.ARTIST,
+    )
+    album = ItemMapping(
+        item_id="album",
+        provider=mapping.provider_instance,
+        name="Album",
+        media_type=MediaType.ALBUM,
+    )
+    track = Track(
+        item_id=mapping.item_id,
+        provider=mapping.provider_instance,
+        name="Song",
+        artists=UniqueList([artist]),
+        album=album,
+        duration=180,
+        track_number=1,
+        provider_mappings={mapping},
+    )
+    return QueueItem(
+        queue_id="q1", queue_item_id="qi1", name="Song", duration=180, media_item=track
+    )
+
+
+def _local_first_audio() -> tuple[StreamsAudio, MagicMock, MagicMock, QueueItem]:
+    """Set up a streamed track with a known local library mapping."""
+    local_id, remote_id = "filesystem_local--local", "tidal--remote"
+    local, remote = _music_provider(local_id), _music_provider(remote_id)
+    audio = _audio({local_id: local, remote_id: remote}, provider_filter=[remote_id])
+    cast("MagicMock", audio.mass).music.providers = [local, remote]
+    local_map = _mapping(local_id, "Artist/Album/song.mp3")
+    remote_map = _mapping(remote_id, "remote", ContentType.FLAC)
+    item = _music_queue_item(remote_map)
+    library_track = _music_queue_item(local_map).media_item
+    assert isinstance(library_track, Track)
+    library_track.provider_mappings.add(remote_map)
+    cast("MagicMock", audio.mass).music.tracks.get_library_item_by_prov_mappings = AsyncMock(
+        return_value=library_track
+    )
+    cast("MagicMock", audio.mass).music.tracks.library_items = AsyncMock(return_value=[])
+    local.get_stream_details.return_value = _streamdetails(
+        local_map.item_id, MediaType.TRACK, local_id
+    )
+    remote.get_stream_details.return_value = _streamdetails(
+        remote_map.item_id, MediaType.TRACK, remote_id
+    )
+    return audio, local, remote, item
+
+
+async def test_known_local_track_wins_over_preferred_higher_quality_stream() -> None:
+    """A streaming-provider queue item plays its linked local file first."""
+    audio, local, remote, item = _local_first_audio()
+    details = await audio.get_stream_details(item)
+    assert details.provider == "filesystem_local--local"
+    local.get_stream_details.assert_awaited_once()
+    remote.get_stream_details.assert_not_awaited()
+
+
+async def test_missing_local_file_falls_back_to_streaming() -> None:
+    """A missing local mapping does not prevent the original provider from playing."""
+    audio, local, remote, item = _local_first_audio()
+    local.get_stream_details.side_effect = MediaNotFoundError("missing")
+    details = await audio.get_stream_details(item)
+    assert details.provider == "tidal--remote"
+    remote.get_stream_details.assert_awaited_once()
+
+
+async def test_direct_local_track_can_fall_back_to_its_linked_stream() -> None:
+    """Selecting a local track retains its linked streaming fallback."""
+    audio, local, remote, _ = _local_first_audio()
+    item = _music_queue_item(_mapping("filesystem_local--local", "Artist/Album/song.mp3"))
+    local.get_stream_details.side_effect = MediaNotFoundError("missing")
+    details = await audio.get_stream_details(item)
+    assert details.provider == "tidal--remote"
+    remote.get_stream_details.assert_awaited_once()
+
+
+async def test_local_decode_failure_falls_back_to_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable local audio source is retried using the streamed mapping."""
+    audio, local, remote, item = _local_first_audio()
+    await audio.get_stream_details(item)
+    result = MagicMock(spec=AudioBuffer)
+    get_buffer = AsyncMock(side_effect=[AudioError("bad local file"), result])
+    monkeypatch.setattr(AudioBuffer, "get_buffer", get_buffer)
+    assert await audio.get_audio_buffer(item, allow_provider_match=False) is result
+    assert item.streamdetails is not None
+    assert item.streamdetails.provider == "tidal--remote"
+    local.get_stream_details.assert_awaited_once()
+    remote.get_stream_details.assert_awaited_once()
+
+
+async def test_unlinked_matching_local_track_is_found_without_stream_search() -> None:
+    """Locally indexed tracks can match a provider track even without a shared mapping."""
+    audio, local, remote, item = _local_first_audio()
+    local_map = _mapping("filesystem_local--local", "Artist/Album/song.mp3")
+    candidate = _music_queue_item(local_map).media_item
+    cast("MagicMock", audio.mass).music.tracks.get_library_item_by_prov_mappings.return_value = None
+    cast("MagicMock", audio.mass).music.tracks.library_items.return_value = [candidate]
+    details = await audio.get_stream_details(item)
+    assert details.provider == "filesystem_local--local"
+    local.get_stream_details.assert_awaited_once()
+    remote.get_stream_details.assert_not_awaited()
+
+
+async def test_different_local_version_is_not_substituted() -> None:
+    """A remix does not replace the requested recording just because its title matches."""
+    audio, local, remote, item = _local_first_audio()
+    candidate = _music_queue_item(_mapping("filesystem_local--local", "remix.mp3")).media_item
+    assert isinstance(candidate, Track)
+    candidate.version = "Remix"
+    cast("MagicMock", audio.mass).music.tracks.get_library_item_by_prov_mappings.return_value = None
+    cast("MagicMock", audio.mass).music.tracks.library_items.return_value = [candidate]
+    details = await audio.get_stream_details(item)
+    assert details.provider == "tidal--remote"
+    local.get_stream_details.assert_not_awaited()
+    remote.get_stream_details.assert_awaited_once()
 
 
 async def test_another_candidate_plays_while_a_provider_backs_off() -> None:
