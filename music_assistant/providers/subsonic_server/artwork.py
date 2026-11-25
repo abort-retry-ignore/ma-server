@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections import OrderedDict
+from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from music_assistant_models.enums import ImageType
 from music_assistant_models.errors import MusicAssistantError
-from music_assistant_models.media_items import Album
+from music_assistant_models.media_items import Album, Track
 
 from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_TRACK, apple_id
 from .index import normalize
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 ARTIST_FILE_NAMES = ("artist.jpg", "artist.png", "folder.jpg")
 COVER_FILE_NAMES = ("cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "album.jpg")
 MAX_CACHED_IMAGES = 300
+# songs of a playlist without its own image that are tried for a cover
+PLAYLIST_COVER_SONGS = 4
 
 
 @dataclass(frozen=True)
@@ -62,23 +65,21 @@ class Artwork:
         if (cached := self._cache.get(key)) is not None:
             self._cache.move_to_end(key)
             return cached
+        playlist_id: int | None = None
         try:
             if (ref := apple_id(cover_id)) is not None:
                 sources = await self._apple_sources(*ref)
             else:
-                sources = await self._sources(*parse_id(cover_id))
+                prefix, item_id = parse_id(cover_id)
+                sources = await self._sources(prefix, item_id)
+                playlist_id = item_id if prefix == PREFIX_PLAYLIST else None
         except SubsonicError:
             return None
-        data: bytes | None = None
-        for path, provider in sources:
-            try:
-                thumb = await self.mass.metadata.get_thumbnail(path, provider, size=size or None)
-            except (MusicAssistantError, OSError) as err:
-                self.server.logger.debug("Cover art for %s not at %s: %s", cover_id, path, err)
-                continue
-            if isinstance(thumb, bytes) and thumb:
-                data = thumb
-                break
+        data = await self._first_image(cover_id, sources, size)
+        if data is None and playlist_id is not None:
+            # MA's playlist collage may not exist (yet): show the first song's cover
+            sources = await self._playlist_song_sources(playlist_id)
+            data = await self._first_image(cover_id, sources, size)
         if data is None:
             return None
         image = Image(data, _content_type(data), f'"{hashlib.sha1(data).hexdigest()[:16]}"')
@@ -98,6 +99,26 @@ class Artwork:
         if request.headers.get("If-None-Match") == image.etag:
             return web.Response(status=304, headers=headers)
         return web.Response(body=image.data, content_type=image.content_type, headers=headers)
+
+    async def _first_image(
+        self, cover_id: str, sources: list[tuple[str, str]], size: int
+    ) -> bytes | None:
+        """
+        Return the first image of the candidates that loads, resized.
+
+        :param cover_id: The cover art ID, for the log.
+        :param sources: The (path, provider) candidates, best first.
+        :param size: The wanted size in pixels; 0 for the original.
+        """
+        for path, provider in sources:
+            try:
+                thumb = await self.mass.metadata.get_thumbnail(path, provider, size=size or None)
+            except (MusicAssistantError, OSError) as err:
+                self.server.logger.debug("Cover art for %s not at %s: %s", cover_id, path, err)
+                continue
+            if isinstance(thumb, bytes) and thumb:
+                return thumb
+        return None
 
     async def _sources(self, prefix: str, item_id: int) -> list[tuple[str, str]]:
         """
@@ -146,6 +167,33 @@ class Artwork:
         if prefix == PREFIX_APPLE_ALBUM:
             return _thumbs(await catalog.album(item_id))
         return _thumbs(await catalog.artist(item_id))
+
+    async def _playlist_song_sources(self, playlist_id: int) -> list[tuple[str, str]]:
+        """
+        Return the cover candidates of a playlist's first few songs, best first.
+
+        :param playlist_id: The library playlist id.
+        """
+        index = self.server.index
+        sources: list[tuple[str, str]] = []
+        checked = 0
+        try:
+            async with aclosing(
+                self.mass.music.playlists.tracks(str(playlist_id), "library")
+            ) as items:
+                async for item in items:
+                    if (track_id := index.track_by_uri.get(item.uri or "")) is not None:
+                        sources += await self._sources(PREFIX_TRACK, track_id)
+                    else:
+                        sources += _thumbs(item)
+                        if isinstance(item, Track) and isinstance(item.album, Album):
+                            sources += _thumbs(item.album)
+                    checked += 1
+                    if checked >= PLAYLIST_COVER_SONGS:
+                        break
+        except MusicAssistantError:
+            pass
+        return list(dict.fromkeys(sources))
 
     async def _album_sources(self, album_id: int) -> list[tuple[str, str]]:
         """

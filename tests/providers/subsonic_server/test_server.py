@@ -475,6 +475,10 @@ async def test_playlists_create_update_delete(server: Server) -> None:
     assert playlist["songCount"] == 2
     listed = (await server.call("getPlaylists"))["playlists"]["playlist"]
     assert playlist["id"] in [p["id"] for p in listed]
+    # a playlist without its own image shows its first song's cover
+    art = await server.get("getCoverArt", id=playlist["coverArt"], size=32)
+    assert art.status == 200
+    assert art.headers["Content-Type"].startswith("image/")
     await server.call(
         "updatePlaylist", playlistId=playlist["id"], songIndexToRemove=0, songIdToAdd=songs[2]["id"]
     )

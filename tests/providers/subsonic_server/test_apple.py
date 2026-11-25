@@ -9,10 +9,11 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from music_assistant_models.enums import StreamType
+from music_assistant_models.enums import MediaType, StreamType
 from music_assistant_models.media_items import (
     Album,
     Artist,
+    ItemMapping,
     ProviderMapping,
     SearchResults,
     Track,
@@ -216,3 +217,46 @@ async def test_apple_plays_and_stars_go_to_ma(
     await server.call("star", id="amt-111")
     assert starred.await_args is not None
     assert starred.await_args.args[0] == f"{APPLE}://track/111"
+
+
+@pytest.mark.usefixtures("apple")
+async def test_artist_known_only_by_name_is_found_by_search(
+    server: Server,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Apple artist without a link (only a name) gets an id that opens it via search."""
+    assert server.provider.server is not None
+    catalog = server.provider.server.catalog
+    named = _track("444", "Paranoid")
+    named.artists = UniqueList(
+        [
+            ItemMapping(
+                media_type=MediaType.ARTIST,
+                item_id="Black Sabbath",
+                provider=APPLE,
+                name="Black Sabbath",
+            )
+        ]
+    )
+    sabbath = Artist(
+        item_id="901", provider=APPLE, name="Black Sabbath", provider_mappings=_mapping("901")
+    )
+    monkeypatch.setattr(catalog, "track", AsyncMock(return_value=named))
+    monkeypatch.setattr(
+        catalog, "search", AsyncMock(return_value=SearchResults(artists=[ARTIST, sabbath]))
+    )
+    # the real lookups, so the name is resolved to the id the search returns
+    monkeypatch.setattr(catalog, "artist", AppleCatalog.artist.__get__(catalog))
+    monkeypatch.setattr(catalog, "artist_albums", AppleCatalog.artist_albums.__get__(catalog))
+    fetched: list[str] = []
+
+    async def _get(kind: str, item_id: str, _getter: Any) -> Any:
+        fetched.append(item_id)
+        return sabbath if kind == "artist" else [ALBUM]
+
+    monkeypatch.setattr(catalog, "_get", _get)
+    song = (await server.call("getSong", id="amt-444"))["song"]
+    assert song["artistId"] == "amr-n" + b"Black Sabbath".hex()
+    artist = (await server.call("getArtist", id=song["artistId"]))["artist"]
+    assert artist["name"] == "Black Sabbath"
+    assert fetched == ["901", "901"]

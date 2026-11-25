@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.media_items import Album, ItemMapping
 
-from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK
+from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK, name_ref
 from .constants import APPLE_BIT_RATE, APPLE_DOMAIN, ERR_NOT_FOUND
 from .responses import SubsonicError
 
@@ -387,7 +387,7 @@ class Mapper:
         :param tracks: The album's tracks to include as songs (none when omitted).
         """
         assert self.catalog is not None
-        item_id = self.catalog.apple_item_id(album) or album.item_id
+        item_id = name_ref(self.catalog.apple_item_id(album) or album.item_id, album.name)
         album_id = make_id(PREFIX_APPLE_ALBUM, item_id)
         artists = [r for r in (self._apple_ref(a) for a in album.artists) if r is not None]
         songs = [s for s in (self.apple_song(t) for t in tracks or []) if s is not None]
@@ -457,7 +457,8 @@ class Mapper:
         """
         assert self.catalog is not None
         artist_id = make_id(
-            PREFIX_APPLE_ARTIST, self.catalog.apple_item_id(artist) or artist.item_id
+            PREFIX_APPLE_ARTIST,
+            name_ref(self.catalog.apple_item_id(artist) or artist.item_id, artist.name),
         )
         entry: dict[str, Any] = {
             "id": artist_id,
@@ -492,9 +493,9 @@ class Mapper:
         if isinstance(item, ItemMapping):
             if item.provider == "library" or not item.provider.startswith(APPLE_DOMAIN):
                 return None
-            return item.item_id, item.name
+            return name_ref(item.item_id, item.name), item.name
         item_id = self.catalog.apple_item_id(item)
-        return (item_id, item.name) if item_id else None
+        return (name_ref(item_id, item.name), item.name) if item_id else None
 
     def _artists(self, artist_ids: list[int]) -> list[dict[str, Any]]:
         """

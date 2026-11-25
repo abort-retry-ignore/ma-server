@@ -43,8 +43,41 @@ PREFIX_APPLE_TRACK = "amt"
 PREFIX_APPLE_ALBUM = "ama"
 PREFIX_APPLE_ARTIST = "amr"
 APPLE_PREFIXES = (PREFIX_APPLE_TRACK, PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST)
-_APPLE_ID = re.compile(r"^[A-Za-z0-9._]{1,64}$")
+_APPLE_ID = re.compile(r"^[A-Za-z0-9._]{1,300}$")
+# real Apple Music ids: catalogue ids are numbers, library ids look like "l.AbC123"
+_REAL_APPLE_ID = re.compile(r"^(\d+|[a-z]\.[A-Za-z0-9]+)$")
+# an artist or album known only by its name, written as "n" + the name in hex
+_NAME_REF = re.compile(r"^n((?:[0-9a-f]{2})+)$")
 _MAX_CACHED = 500
+
+
+def name_ref(item_id: str, name: str) -> str:
+    """
+    Return a usable id for an album or artist reference.
+
+    MA's Apple Music provider uses the name as id when Apple gives no link to the artist or
+    album; such a reference is encoded so it can be looked up by name later.
+
+    :param item_id: The id of the reference.
+    :param name: The name of the album or artist.
+    """
+    if _REAL_APPLE_ID.match(item_id):
+        return item_id
+    return "n" + name.encode().hex()
+
+
+def _name_of(item_id: str) -> str | None:
+    """
+    Return the name of a reference made by ``name_ref``, or None for a real id.
+
+    :param item_id: The id.
+    """
+    if (match := _NAME_REF.match(item_id)) is None:
+        return None
+    try:
+        return bytes.fromhex(match.group(1)).decode()
+    except UnicodeDecodeError:
+        return None
 
 
 def apple_id(value: str | None, *allowed: str) -> tuple[str, str] | None:
@@ -170,6 +203,7 @@ class AppleCatalog:
         :param item_id: The Apple Music album id.
         :raises SubsonicError: Not found (70).
         """
+        item_id = await self._real_id(item_id, MediaType.ALBUM)
         return cast(
             "Album", await self._get("album", item_id, self.mass.music.albums.get_provider_item)
         )
@@ -181,6 +215,7 @@ class AppleCatalog:
         :param item_id: The Apple Music artist id.
         :raises SubsonicError: Not found (70).
         """
+        item_id = await self._real_id(item_id, MediaType.ARTIST)
         return cast(
             "Artist", await self._get("artist", item_id, self.mass.music.artists.get_provider_item)
         )
@@ -191,6 +226,7 @@ class AppleCatalog:
 
         :param item_id: The Apple Music album id.
         """
+        item_id = await self._real_id(item_id, MediaType.ALBUM)
         return cast(
             "list[Track]", await self._get("album_tracks", item_id, self.mass.music.albums.tracks)
         )
@@ -201,6 +237,7 @@ class AppleCatalog:
 
         :param item_id: The Apple Music artist id.
         """
+        item_id = await self._real_id(item_id, MediaType.ARTIST)
         return cast(
             "list[Album]", await self._get("artist_albums", item_id, self.mass.music.artists.albums)
         )
@@ -288,6 +325,26 @@ class AppleCatalog:
             )
             self.server.schedule_index_rebuild()
             return str(path)
+
+    async def _real_id(self, item_id: str, media_type: MediaType) -> str:
+        """
+        Return the real Apple Music id for an id made by ``name_ref``, by searching the name.
+
+        :param item_id: The id (returned unchanged when it is already a real id).
+        :param media_type: Album or artist.
+        :raises SubsonicError: Not found (70) when the search finds nothing by that name.
+        """
+        if (name := _name_of(item_id)) is None:
+            return item_id
+        results = await self.search(name)
+        found: list[Any] = []
+        if results is not None:
+            found = list(results.artists if media_type == MediaType.ARTIST else results.albums)
+        wanted = name.casefold()
+        for item in sorted(found, key=lambda i: i.name.casefold() != wanted):
+            if (real := self.apple_item_id(item)) is not None:
+                return real
+        raise SubsonicError(ERR_NOT_FOUND, f"Not found on Apple Music: {name}")
 
     def _streams(self) -> Any:
         """
