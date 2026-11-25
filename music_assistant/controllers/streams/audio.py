@@ -64,7 +64,7 @@ from music_assistant_models.errors import (
 )
 from music_assistant_models.media_items import Album, AudioFormat, Track
 from music_assistant_models.player_queue import PlayLogEntry
-from music_assistant_models.streamdetails import MultiPartPath, StreamMetadata
+from music_assistant_models.streamdetails import MultiPartPath, StreamDetails, StreamMetadata
 
 from music_assistant.constants import (
     CONF_CROSSFADE_DURATION,
@@ -145,6 +145,7 @@ from music_assistant.helpers.ffmpeg import (
     FFMpeg,
     get_ffmpeg_overlay_stream,
     get_ffmpeg_stream,
+    redact_audio_urls,
 )
 from music_assistant.helpers.named_pipe import read_named_pipe
 from music_assistant.helpers.playlists import (
@@ -171,7 +172,6 @@ if TYPE_CHECKING:
     from music_assistant_models.media_items import ProviderMapping
     from music_assistant_models.player_queue import PlayerQueue
     from music_assistant_models.queue_item import QueueItem
-    from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.player import Player
@@ -3561,6 +3561,8 @@ class StreamsAudio:
 
         deadline = loop.time() + capacity_wait_timeout
         busy_instances: set[str] = set()
+        invalidated_cache_entries: set[tuple[str, str]] = set()
+        retried_cache_streams: set[tuple[str, str]] = set()
         final_pass = False
         last_capacity_error: ProviderStreamLimitError | None = None
         last_failed_streamdetails: StreamDetails | None = None
@@ -3676,6 +3678,33 @@ class StreamsAudio:
                 queue_item.streamdetails = None
             except AudioError:
                 provider = self.mass.get_provider(streamdetails.provider)
+                cache_key = (streamdetails.provider, streamdetails.item_id)
+                invalidate_cache = getattr(provider, "invalidate_cached_stream", None)
+                if (
+                    streamdetails.stream_type == StreamType.LOCAL_FILE
+                    and cache_key not in invalidated_cache_entries
+                    and callable(invalidate_cache)
+                ):
+                    invalidated_cache_entries.add(cache_key)
+                    if await invalidate_cache(streamdetails):
+                        self.logger.warning(
+                            "Cached audio for %s failed; retrying the source", queue_item.name
+                        )
+                        queue_item.streamdetails = None
+                        continue
+                fallback_stream = getattr(provider, "fallback_failed_stream", None)
+                if (
+                    streamdetails.stream_type == StreamType.CUSTOM
+                    and cache_key not in retried_cache_streams
+                    and callable(fallback_stream)
+                ):
+                    retried_cache_streams.add(cache_key)
+                    if isinstance(fallback := await fallback_stream(streamdetails), StreamDetails):
+                        self.logger.warning(
+                            "Cached stream for %s failed; retrying the source", queue_item.name
+                        )
+                        queue_item.streamdetails = fallback
+                        continue
                 if (
                     isinstance(queue_item.media_item, Track)
                     and provider is not None
@@ -4105,8 +4134,12 @@ class StreamsAudio:
             if isinstance(err, ProviderStreamLimitError):
                 raise
             # dump the last 10 lines of the log in case of an unclean exit
-            logger.warning("\n".join(list(ffmpeg_proc.log_history)[-10:]))
-            raise AudioError(f"Error while streaming: {err}") from err
+            logger.warning(redact_audio_urls("\n".join(list(ffmpeg_proc.log_history)[-10:])))
+            error_text = str(err)
+            redacted_error = redact_audio_urls(error_text)
+            if redacted_error != error_text:
+                raise AudioError(f"Error while streaming: {redacted_error}") from None
+            raise AudioError(f"Error while streaming: {redacted_error}") from err
         finally:
             # An ffmpeg wedged on an input that will never deliver again pays close()'s
             # full drain - some 12 seconds in practice - under a held player lock,
@@ -4343,6 +4376,11 @@ class StreamsAudio:
                         f"Provider {streamdetails.provider} for stream is no longer available"
                     )
                 provider = cast("MusicProvider | PluginProvider", provider)
+                seekable_source = getattr(provider, "get_seekable_stream_source", None)
+                if seek_position > 0 and callable(seekable_source):
+                    source = seekable_source(streamdetails)
+                    if isinstance(source, str) and source:
+                        return source, seek_position, extra_input_args
                 audio_source = provider.get_audio_stream(
                     streamdetails, seek_position=seek_position if streamdetails.can_seek else 0
                 )

@@ -60,6 +60,7 @@ _FFMPEG_BIT_RATE_RE: Final = re.compile(r"(\d+) kb/s")
 _FFMPEG_EXPLICIT_BIT_DEPTH_RE: Final = re.compile(r"\((\d+) bit\)")
 _FFMPEG_SAMPLE_FMT_RE: Final = re.compile(r"\b(u8p?|s16p?|s24p?|s32p?|fltp?|dblp?)\b")
 _FFMPEG_DURATION_RE: Final = re.compile(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)")
+_AUDIO_URL_RE: Final = re.compile(r"https?://[^\s\"'<>]+")
 
 # Mapping from ffmpeg sample format token to bit depth.
 # Note: planar variants (suffix 'p') describe memory layout only.
@@ -80,6 +81,11 @@ _SAMPLE_FMT_BIT_DEPTH: Final[dict[str, int]] = {
     "dbl": 64,
     "dblp": 64,
 }
+
+
+def redact_audio_urls(text: str) -> str:
+    """Remove upstream audio URLs from text that may be exposed to clients."""
+    return _AUDIO_URL_RE.sub("<redacted audio URL>", text)
 
 
 @dataclass
@@ -199,7 +205,8 @@ class FFMpeg(AsyncProcess):
         """Read ffmpeg log from stderr."""
         decode_errors = 0
         decode_errors_reported = False
-        async for line in self.iter_stderr():
+        async for raw_line in self.iter_stderr():
+            line = redact_audio_urls(raw_line)
             if self.collect_log_history:
                 self.log_history.append(line)
             # ffmpeg logging can be quite verbose, so we only log critical errors

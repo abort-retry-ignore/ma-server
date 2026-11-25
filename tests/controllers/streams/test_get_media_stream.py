@@ -368,6 +368,33 @@ async def test_get_media_stream_kills_ffmpeg_when_source_stalls(
 
 
 @pytest.mark.asyncio
+async def test_get_media_stream_redacts_upstream_url_in_errors_and_logs(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An FFmpeg failure must not reveal a provider's audio URL to a caller."""
+    url = "https://example.invalid/audio?secret=value"
+
+    class FailingFFMpeg(_FakeFFMpeg):
+        exit_code = 1
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.log_history = [f"Failed to open {url}"]
+
+    monkeypatch.setattr(audio_mod, "FFMpeg", FailingFFMpeg)
+    audio = _make_audio_controller()
+    details = _seekable_streamdetails()
+    details.path = url
+
+    with pytest.raises(AudioError) as err:
+        await _drain(audio.get_media_stream(details, _make_pcm_format()))
+
+    assert url not in str(err.value)
+    assert "<redacted audio URL>" in str(err.value)
+    assert url not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_get_media_stream_kills_ffmpeg_when_cancelled(
     patch_ffmpeg: type[_FakeFFMpeg],
 ) -> None:

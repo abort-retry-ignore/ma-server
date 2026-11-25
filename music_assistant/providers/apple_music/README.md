@@ -7,6 +7,20 @@ source to publish completed clear files there, with tags and album artwork. An u
 leaves the audio cache outside the local library. Incomplete downloads and encrypted entries are
 not published.
 
+## Audio quality and file size
+
+The cache should avoid unnecessary re-compression and additional quality loss, while keeping file
+size in mind. The Apple Music cache decrypts and remuxes the already-compressed AAC stream with
+FFmpeg's `-c:a copy`, rather than decoding and re-encoding it. This preserves the source audio
+quality while keeping the files compact; it does not make the original lossy AAC lossless.
+
+Apple Music currently publishes these tracks in M4A containers. This is an implementation detail,
+not a library-wide requirement or preference; other supported audio formats are acceptable. The
+[YouTube Music cache](../ytmusic/README.md) follows the same quality and size goals by remuxing its
+selected compressed stream without re-encoding.
+
+## Metadata export
+
 After publication, metadata is exported in the background, with a follow-up after two minutes and
 an hourly retry. The exporter first uses Apple Music metadata already in MA's cache, then the MA
 library's merged metadata. Missing data is scheduled through MA's existing throttled metadata

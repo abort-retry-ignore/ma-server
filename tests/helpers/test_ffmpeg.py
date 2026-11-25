@@ -1059,6 +1059,29 @@ class _FakeProcRacingExit(_FakeProc):
         raise ProcessLookupError("no such process")
 
 
+async def test_log_reader_redacts_upstream_audio_urls() -> None:
+    """Signed service URLs never enter FFmpeg log history or diagnostic logs."""
+    url = "https://example.invalid/audio?secret=value"
+    ffmpeg = FFMpeg(
+        audio_input=url,
+        input_format=_PCM_FORMAT,
+        output_format=_PCM_FORMAT,
+        collect_log_history=True,
+    )
+
+    async def fake_stderr() -> AsyncGenerator[str]:
+        yield f"Opening '{url}' for reading"
+
+    ffmpeg.iter_stderr = fake_stderr  # type: ignore[method-assign]
+    logger = Mock()
+    ffmpeg.logger = logger
+    await ffmpeg._log_reader_task()
+
+    assert url not in " ".join(ffmpeg.log_history)
+    assert "<redacted audio URL>" in " ".join(ffmpeg.log_history)
+    assert url not in str(logger.mock_calls)
+
+
 async def test_log_reader_reports_decode_errors_once_and_aborts() -> None:
     """
     Crossing the decode-error threshold logs a single line and aborts the stream.

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib
 import logging
+import os
 import time
 from collections.abc import AsyncGenerator, Iterable
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from datetime import datetime
 from io import StringIO
 from typing import TYPE_CHECKING, Any, cast
@@ -24,6 +26,7 @@ from music_assistant_models.enums import (
     StreamType,
 )
 from music_assistant_models.errors import (
+    AudioError,
     InvalidDataError,
     LoginFailed,
     MediaNotFoundError,
@@ -68,7 +71,17 @@ from music_assistant.helpers.util import (
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.models.recommendation_payload import RecommendationPayloadMixin
 
+from .audio_cache import (
+    ENV_AUDIO_CACHE_PATH,
+    ENV_AUDIO_LIBRARY_PATH,
+    YoutubeAudioCache,
+    YoutubeCacheHit,
+    YoutubeDownload,
+    provider_cache_root,
+    selected_extension,
+)
 from .helpers import (
+    YTM_THROTTLER,
     YTMSearchFilter,
     add_remove_playlist_tracks,
     convert_to_netscape,
@@ -137,6 +150,8 @@ DYNAMIC_PLAYLIST_TRACK_LIMIT = 300
 YTM_PREMIUM_CHECK_TRACK_ID = "dQw4w9WgXcQ"
 PACKAGES_TO_INSTALL = ("yt-dlp[default]", "bgutil-ytdlp-pot-provider")
 DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
+_PREFERRED_AUDIO_FORMAT = "bestaudio[acodec^=opus]/bestaudio[acodec~='^(mp4a|aac)']/bestaudio"
+_PREMIUM_CHECK_FORMAT = "m4a/bestaudio"
 
 SUPPORTED_FEATURES = {
     ProviderFeature.LIBRARY_ARTISTS,
@@ -183,6 +198,7 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
     _yt_user: str | None
     _cookie: str
     _yt_dlp_module = None
+    _audio_cache: YoutubeAudioCache | None = None
 
     @property
     def max_concurrent_streams(self) -> int:
@@ -227,6 +243,24 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
             self.language = "en"
         if not await self._user_has_ytm_premium():
             raise LoginFailed("User does not have Youtube Music Premium")
+        if cache_root := os.environ.get(ENV_AUDIO_CACHE_PATH, "").strip():
+            if instance_root := provider_cache_root(cache_root, self.instance_id):
+                library_root = os.environ.get(ENV_AUDIO_LIBRARY_PATH, "").strip() or None
+                cache = YoutubeAudioCache(self, instance_root, library_root)
+                if await cache.setup():
+                    self._audio_cache = cache
+                    self.logger.info("Keeping played YouTube Music audio in %s", cache.root)
+            else:
+                self.logger.warning("YouTube Music cache path or provider instance is invalid")
+
+    async def loaded_in_mass(self) -> None:
+        """Publish existing cache entries when the local provider is ready."""
+        await super().loaded_in_mass()
+        if self._audio_cache and self._audio_cache.library:
+            self.mass.create_task(
+                self._publish_cached_audio,
+                task_id=f"{self.instance_id}.publish_cached_audio",
+            )
 
     # the checksum invalidates entries cached before the search was pinned to English
     @use_cache(3600 * 24 * 7, cache_checksum="english_search_v1")  # Cache for 7 days
@@ -676,6 +710,25 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
+        if media_type == MediaType.TRACK and self._audio_cache:
+            if cached := await self._audio_cache.lookup(item_id):
+                path, cached_extension = cached
+                self.mass.create_task(
+                    self._audio_cache.refresh_metadata,
+                    item_id,
+                    task_id=f"{self.instance_id}.refresh_cached_metadata.{item_id}",
+                )
+                return StreamDetails(
+                    provider=self.instance_id,
+                    item_id=item_id,
+                    media_type=media_type,
+                    audio_format=AudioFormat(content_type=ContentType.try_parse(cached_extension)),
+                    stream_type=StreamType.LOCAL_FILE,
+                    path=path,
+                    data=YoutubeCacheHit(item_id),
+                    can_seek=True,
+                    allow_seek=True,
+                )
         if media_type == MediaType.PODCAST_EPISODE:
             item_id = item_id.split(PODCAST_EPISODE_SPLITTER)[1]
         stream_format = await self._get_stream_format(item_id=item_id)
@@ -705,7 +758,80 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
             stream_details.audio_format.channels = int(audio_channels)
         if asr := stream_format.get("asr"):
             stream_details.audio_format.sample_rate = int(asr)
+        if (
+            media_type == MediaType.TRACK
+            and self._audio_cache
+            and (extension := selected_extension(stream_format))
+        ):
+            headers = stream_format.get("http_headers")
+            size = stream_format.get("filesize")
+            stream_details.stream_type = StreamType.CUSTOM
+            stream_details.path = None
+            stream_details.data = YoutubeDownload(
+                url=url,
+                headers=headers if isinstance(headers, dict) else {},
+                source_format=str(stream_format.get("audio_ext") or ""),
+                extension=extension,
+                expected_size=size if isinstance(size, int) and size > 0 else None,
+            )
         return stream_details
+
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes]:
+        """Stream YouTube Music audio while keeping complete tracks when possible."""
+        if not self._audio_cache or not isinstance(streamdetails.data, YoutubeDownload):
+            raise MediaNotFoundError("YouTube Music cache stream is unavailable")
+        if seek_position:
+            raise AudioError("YouTube Music seeks must use the private seekable source")
+        async with aclosing(
+            self._audio_cache.stream_and_store(streamdetails.item_id, streamdetails.data)
+        ) as stream:
+            async for chunk in stream:
+                yield chunk
+
+    def get_seekable_stream_source(self, streamdetails: StreamDetails) -> str | None:
+        """Return the private source for seeking without caching an incomplete track."""
+        if isinstance(streamdetails.data, YoutubeDownload):
+            return streamdetails.data.url
+        return None
+
+    async def fallback_failed_stream(self, streamdetails: StreamDetails) -> StreamDetails | None:
+        """Retry a failed cache stream from a completed copy or its private source."""
+        if not isinstance(streamdetails.data, YoutubeDownload):
+            return None
+        if self._audio_cache and (cached := await self._audio_cache.lookup(streamdetails.item_id)):
+            path, extension = cached
+            return dataclasses.replace(
+                streamdetails,
+                stream_type=StreamType.LOCAL_FILE,
+                audio_format=AudioFormat(content_type=ContentType.try_parse(extension)),
+                path=path,
+                data=YoutubeCacheHit(streamdetails.item_id),
+                is_realtime=False,
+                buffer=None,
+                stream_error=None,
+            )
+        return dataclasses.replace(
+            streamdetails,
+            stream_type=StreamType.HTTP,
+            path=streamdetails.data.url,
+            data=None,
+            buffer=None,
+            stream_error=None,
+        )
+
+    async def invalidate_cached_stream(self, streamdetails: StreamDetails) -> bool:
+        """Forget a failed cache entry so playback can retry the remote source."""
+        if (
+            self._audio_cache
+            and isinstance(streamdetails.data, YoutubeCacheHit)
+            and isinstance(streamdetails.path, str)
+        ):
+            return await self._audio_cache.invalidate(
+                streamdetails.data.item_id, streamdetails.path
+            )
+        return False
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's available recommendation rows, without items."""
@@ -1166,6 +1292,16 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
                 episode.metadata.release_date = datetime.fromisoformat(release_date)
         return episode
 
+    async def _publish_cached_audio(self) -> None:
+        """Retry publication of completed tracks in the background."""
+        with suppress(TimeoutError):
+            await asyncio.wait_for(
+                self.mass.get_provider_ready_event("filesystem_local").wait(), 30
+            )
+        while self._audio_cache and self._audio_cache.library:
+            await self._audio_cache.library.publish_all()
+            await asyncio.sleep(3600)
+
     async def _get_stream_format(
         self, item_id: str, *, require_login: bool = False
     ) -> dict[str, Any]:
@@ -1191,6 +1327,9 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
                     },
                 },
             }
+            if not require_login:
+                ydl_opts["format_sort"] = ["abr", "asr"]
+                ydl_opts["format_sort_force"] = True
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 had_login = _has_login_cookie(ydl.cookiejar)
                 try:
@@ -1206,7 +1345,9 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
                         translation_key="cookies_expired",
                         translation_owner=self.translation_owner,
                     )
-                format_selector = ydl.build_format_selector("m4a/bestaudio")
+                format_selector = ydl.build_format_selector(
+                    _PREMIUM_CHECK_FORMAT if require_login else _PREFERRED_AUDIO_FORMAT
+                )
                 stream_format: dict[str, Any] | None = next(
                     format_selector({"formats": info["formats"]}), None
                 )
@@ -1214,6 +1355,7 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
                     raise UnplayableMediaError("No stream formats found")
                 return stream_format
 
+        await YTM_THROTTLER.acquire()
         return await asyncio.to_thread(_extract_best_stream_url_format)
 
     def _get_item_mapping(self, media_type: MediaType, key: str, name: str) -> ItemMapping:

@@ -18,10 +18,12 @@ from music_assistant_models.errors import LoginFailed, MediaNotFoundError
 from ytmusicapi import LikeStatus
 from ytmusicapi.exceptions import YTMusicError, YTMusicServerError
 
+from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.providers.ytmusic.constants import YTMRecommendationIcons
 
 # subset of ytmusicapi's accepted search filters that we use
 YTMSearchFilter = Literal["artists", "albums", "songs", "playlists", "podcasts"]
+YTM_THROTTLER = Throttler(rate_limit=1, period=1)
 
 
 async def get_artist(
@@ -436,6 +438,7 @@ def determine_recommendation_icon(name: str) -> str:
 
 async def _run_ytmusic[T](func: Callable[[], T]) -> T:
     """Run a blocking ytmusicapi call in a thread, translating a signed-out session."""
+    await YTM_THROTTLER.acquire()
     try:
         return await asyncio.to_thread(func)
     except (KeyError, IndexError) as err:

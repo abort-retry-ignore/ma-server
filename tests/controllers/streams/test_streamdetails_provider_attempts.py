@@ -515,6 +515,114 @@ async def test_local_decode_failure_falls_back_to_streaming(
     remote.get_stream_details.assert_awaited_once()
 
 
+async def test_corrupt_provider_cache_retries_the_remote_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A streaming provider's failed local cache is invalidated once, then retried."""
+    instance = "ytmusic--remote"
+    provider = _music_provider(instance)
+    audio = _audio({instance: provider})
+    cached = _streamdetails("track", MediaType.TRACK, instance)
+    cached.stream_type = StreamType.LOCAL_FILE
+    cached.path = "/local/cached.m4a"
+    remote = _streamdetails("track", MediaType.TRACK, instance)
+    provider.get_stream_details.side_effect = [cached, remote]
+    provider.invalidate_cached_stream = AsyncMock(return_value=True)
+    item = _music_queue_item(_mapping(instance, "track"))
+    await audio.get_stream_details(item)
+    result = MagicMock(spec=AudioBuffer)
+    get_buffer = AsyncMock(side_effect=[AudioError("bad cache"), result])
+    monkeypatch.setattr(AudioBuffer, "get_buffer", get_buffer)
+
+    assert await audio.get_audio_buffer(item, allow_provider_match=False) is result
+    provider.invalidate_cached_stream.assert_awaited_once_with(cached)
+    assert provider.get_stream_details.await_count == 2
+    assert item.streamdetails is remote
+
+
+async def test_corrupt_linked_file_and_provider_cache_fall_back_to_remote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken filesystem copy and the provider's cache do not block streaming."""
+    local_id, remote_id = "filesystem_local--local", "ytmusic--remote"
+    local, remote = _music_provider(local_id), _music_provider(remote_id)
+    audio = _audio({local_id: local, remote_id: remote})
+    cast("MagicMock", audio.mass).music.providers = [local, remote]
+    local_map = _mapping(local_id, "Artist/Album/song.m4a")
+    remote_map = _mapping(remote_id, "video")
+    item = _music_queue_item(remote_map)
+    library_track = _music_queue_item(local_map).media_item
+    assert isinstance(library_track, Track)
+    library_track.provider_mappings.add(remote_map)
+    cast("MagicMock", audio.mass).music.tracks.get_library_item_by_prov_mappings = AsyncMock(
+        return_value=library_track
+    )
+    local_details = _streamdetails(local_map.item_id, MediaType.TRACK, local_id)
+    local_details.stream_type = StreamType.LOCAL_FILE
+    local.get_stream_details.return_value = local_details
+    cache_details = _streamdetails(remote_map.item_id, MediaType.TRACK, remote_id)
+    cache_details.stream_type = StreamType.LOCAL_FILE
+    remote_details = _streamdetails(remote_map.item_id, MediaType.TRACK, remote_id)
+    remote.get_stream_details.side_effect = [cache_details, remote_details]
+    remote.invalidate_cached_stream = AsyncMock(return_value=True)
+    await audio.get_stream_details(item)
+    result = MagicMock(spec=AudioBuffer)
+    get_buffer = AsyncMock(side_effect=[AudioError("bad local"), AudioError("bad cache"), result])
+    monkeypatch.setattr(AudioBuffer, "get_buffer", get_buffer)
+
+    assert await audio.get_audio_buffer(item, allow_provider_match=False) is result
+    remote.invalidate_cached_stream.assert_awaited_once_with(cache_details)
+    assert remote.get_stream_details.await_count == 2
+    assert item.streamdetails is remote_details
+
+
+async def test_failed_custom_cache_stream_falls_back_without_reresolving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed cache tee retries the already-resolved private source only once."""
+    instance = "ytmusic--remote"
+    provider = _music_provider(instance)
+    audio = _audio({instance: provider})
+    cached_stream = _streamdetails("track", MediaType.TRACK, instance)
+    cached_stream.stream_type = StreamType.CUSTOM
+    cached_stream.path = None
+    direct_stream = _streamdetails("track", MediaType.TRACK, instance)
+    provider.get_stream_details.return_value = cached_stream
+    provider.fallback_failed_stream = AsyncMock(return_value=direct_stream)
+    item = _music_queue_item(_mapping(instance, "track"))
+    await audio.get_stream_details(item)
+    result = MagicMock(spec=AudioBuffer)
+    get_buffer = AsyncMock(side_effect=[AudioError("cache tee failed"), result])
+    monkeypatch.setattr(AudioBuffer, "get_buffer", get_buffer)
+
+    assert await audio.get_audio_buffer(item, allow_provider_match=False) is result
+    provider.fallback_failed_stream.assert_awaited_once_with(cached_stream)
+    provider.get_stream_details.assert_awaited_once()
+    assert item.streamdetails is direct_stream
+
+
+async def test_failed_cache_invalidation_does_not_retry_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a cache cannot be invalidated, report the decode error instead of looping."""
+    instance = "ytmusic--remote"
+    provider = _music_provider(instance)
+    audio = _audio({instance: provider})
+    cached = _streamdetails("track", MediaType.TRACK, instance)
+    cached.stream_type = StreamType.LOCAL_FILE
+    cached.path = "/local/cached.m4a"
+    provider.get_stream_details.return_value = cached
+    provider.invalidate_cached_stream = AsyncMock(return_value=False)
+    item = _music_queue_item(_mapping(instance, "track"))
+    await audio.get_stream_details(item)
+    monkeypatch.setattr(AudioBuffer, "get_buffer", AsyncMock(side_effect=AudioError("bad cache")))
+
+    with pytest.raises(AudioError, match="bad cache"):
+        await audio.get_audio_buffer(item, allow_provider_match=False)
+    provider.invalidate_cached_stream.assert_awaited_once_with(cached)
+    assert provider.get_stream_details.await_count == 1
+
+
 async def test_unlinked_matching_local_track_is_found_without_stream_search() -> None:
     """Locally indexed tracks can match a provider track even without a shared mapping."""
     audio, local, remote, item = _local_first_audio()
