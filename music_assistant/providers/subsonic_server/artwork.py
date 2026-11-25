@@ -183,7 +183,10 @@ class Artwork:
         except MusicAssistantError:
             return []
         images: list[MediaItemImage] = list(item.metadata.images or []) if item.metadata else []
-        return [(i.path, i.provider) for i in images if i.type == ImageType.THUMB]
+        # square covers first; a wide video thumbnail (YouTube) only when there is nothing else
+        ordered = [i for i in images if i.type == ImageType.THUMB]
+        ordered += [i for i in images if i.type == ImageType.LANDSCAPE]
+        return [(i.path, i.provider) for i in ordered]
 
 
 def _content_type(data: bytes) -> str:
