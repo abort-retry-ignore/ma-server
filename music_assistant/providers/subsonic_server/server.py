@@ -16,9 +16,11 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import set_cu
 from music_assistant.helpers.webserver import Webserver
 
 from . import api_library, api_media, api_user  # noqa: F401  # registers the API methods
+from .apple import AppleCatalog
 from .artwork import Artwork
 from .auth import Authenticator
 from .constants import (
+    CONF_APPLE_SEARCH,
     CONF_LOG_REQUESTS,
     CONF_SERVER_TYPE,
     ERR_GENERIC,
@@ -58,6 +60,7 @@ class SubsonicServer:
         self.storage = Storage(self.mass.storage_path)
         self.auth = Authenticator(provider.lookup_user, self.logger)
         self.artwork = Artwork(self)
+        self.catalog = AppleCatalog(self)
         self.now_playing: dict[tuple[str, str], NowPlaying] = {}
         self._webserver = Webserver(self.logger)
         self._reported: set[tuple[str, str]] = set()
@@ -90,6 +93,11 @@ class SubsonicServer:
         """Stop listening and close the storage."""
         await self._webserver.close()
         await self.storage.close()
+
+    @property
+    def apple_search_enabled(self) -> bool:
+        """Return whether Apple Music search results are offered to clients."""
+        return bool(self.provider.config.get_value(CONF_APPLE_SEARCH, True))
 
     def schedule_index_rebuild(self) -> None:
         """Rebuild the library index shortly, after a burst of library changes has settled."""

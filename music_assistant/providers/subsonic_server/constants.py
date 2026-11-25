@@ -17,6 +17,7 @@ CONF_MUSIC_FOLDERS: Final = "music_folders"
 CONF_LOG_REQUESTS: Final = "log_requests"
 CONF_SERVER_TYPE: Final = "server_type"
 CONF_PASSWORD_PREFIX: Final = "password_"
+CONF_APPLE_SEARCH: Final = "apple_search"
 DEFAULT_PORT: Final = 4040
 DEFAULT_BIND_IP: Final = "0.0.0.0"
 
@@ -38,6 +39,17 @@ LOCKOUT_SECONDS: Final = 300
 DEFAULT_LIST_SIZE: Final = 10
 MAX_LIST_SIZE: Final = 500
 DEFAULT_SEARCH_COUNT: Final = 20
+
+# Apple Music catalogue: shortest query sent to Apple, results per type, how long results
+# are kept, how long a client waits for a song to be saved, and saves running at once
+APPLE_DOMAIN: Final = "apple_music"
+APPLE_SEARCH_MIN_LENGTH: Final = 3
+APPLE_SEARCH_LIMIT: Final = 25
+APPLE_TTL: Final = 600
+APPLE_SAVE_TIMEOUT: Final = 55
+MAX_APPLE_SAVES: Final = 2
+# Apple Music serves AAC at 256 kbps: used to estimate the size of a song not saved yet
+APPLE_BIT_RATE: Final = 256
 
 # rebuild the library index this long after the last library change
 INDEX_REBUILD_DELAY: Final = 3.0

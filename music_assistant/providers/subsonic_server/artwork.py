@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from music_assistant_models.enums import ImageType
 from music_assistant_models.errors import MusicAssistantError
+from music_assistant_models.media_items import Album
 
+from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_TRACK, apple_id
 from .index import normalize
 from .mapping import PREFIX_ALBUM, PREFIX_ARTIST, PREFIX_PLAYLIST, PREFIX_TRACK, parse_id
 from .responses import SubsonicError
@@ -61,11 +63,14 @@ class Artwork:
             self._cache.move_to_end(key)
             return cached
         try:
-            prefix, item_id = parse_id(cover_id)
+            if (ref := apple_id(cover_id)) is not None:
+                sources = await self._apple_sources(*ref)
+            else:
+                sources = await self._sources(*parse_id(cover_id))
         except SubsonicError:
             return None
         data: bytes | None = None
-        for path, provider in await self._sources(prefix, item_id):
+        for path, provider in sources:
             try:
                 thumb = await self.mass.metadata.get_thumbnail(path, provider, size=size or None)
             except (MusicAssistantError, OSError) as err:
@@ -121,6 +126,26 @@ class Artwork:
         if prefix == PREFIX_PLAYLIST:
             return await self._library_images(music.playlists, item_id)
         return []
+
+    async def _apple_sources(self, prefix: str, item_id: str) -> list[tuple[str, str]]:
+        """
+        Return the image candidates for an Apple Music song, album or artist.
+
+        :param prefix: The Apple ID type prefix.
+        :param item_id: The Apple Music id.
+        """
+        catalog = self.server.catalog
+        if prefix == PREFIX_APPLE_TRACK:
+            if (saved := catalog.library_track(item_id)) is not None:
+                return await self._sources(PREFIX_TRACK, saved.id)
+            item: Any = await catalog.track(item_id)
+            images = _thumbs(item)
+            if isinstance(item.album, Album):
+                images += _thumbs(item.album)
+            return list(dict.fromkeys(images))
+        if prefix == PREFIX_APPLE_ALBUM:
+            return _thumbs(await catalog.album(item_id))
+        return _thumbs(await catalog.artist(item_id))
 
     async def _album_sources(self, album_id: int) -> list[tuple[str, str]]:
         """
@@ -190,6 +215,18 @@ class Artwork:
         ordered = [i for i in images if i.type == ImageType.THUMB]
         ordered += [i for i in images if i.type == ImageType.LANDSCAPE]
         return [(i.path, i.provider) for i in ordered]
+
+
+def _thumbs(item: Any) -> list[tuple[str, str]]:
+    """
+    Return the (path, provider) of an item's square images, then its wide ones.
+
+    :param item: A media item.
+    """
+    images = list(item.metadata.images or []) if item.metadata else []
+    ordered = [i for i in images if i.type == ImageType.THUMB]
+    ordered += [i for i in images if i.type == ImageType.LANDSCAPE]
+    return [(i.path, i.provider) for i in ordered]
 
 
 def _content_type(data: bytes) -> str:

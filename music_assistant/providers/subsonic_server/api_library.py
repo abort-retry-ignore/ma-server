@@ -7,7 +7,9 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.errors import MusicAssistantError
+from music_assistant_models.media_items import Track
 
+from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK, apple_id
 from .constants import (
     DEFAULT_LIST_SIZE,
     DEFAULT_SEARCH_COUNT,
@@ -17,7 +19,7 @@ from .constants import (
     IGNORED_ARTICLES,
 )
 from .context import RequestContext, api_method
-from .index import IndexedAlbum, IndexedArtist, IndexedTrack, index_letter
+from .index import IndexedAlbum, IndexedArtist, IndexedTrack, index_letter, normalize
 from .mapping import (
     PREFIX_ALBUM,
     PREFIX_ARTIST,
@@ -55,7 +57,13 @@ async def get_artists(ctx: RequestContext) -> dict[str, Any]:
 @api_method("getArtist")
 async def get_artist(ctx: RequestContext) -> dict[str, Any]:
     """Return an artist with its albums."""
-    artist = _artist(ctx, ctx.require("id"))
+    value = ctx.require("id")
+    if (ref := apple_id(value, PREFIX_APPLE_ARTIST)) is not None:
+        catalog = ctx.server.catalog
+        apple_artist = await catalog.artist(ref[1])
+        apple_albums = await catalog.artist_albums(ref[1])
+        return {"artist": ctx.mapper.apple_artist(apple_artist, apple_albums)}
+    artist = _artist(ctx, value)
     albums = ctx.server.index.artist_albums(artist)
     return {"artist": ctx.mapper.artist(artist, albums)}
 
@@ -63,20 +71,28 @@ async def get_artist(ctx: RequestContext) -> dict[str, Any]:
 @api_method("getAlbum")
 async def get_album(ctx: RequestContext) -> dict[str, Any]:
     """Return an album with its songs."""
-    album = _album(ctx, ctx.require("id"))
+    value = ctx.require("id")
+    if (ref := apple_id(value, PREFIX_APPLE_ALBUM)) is not None:
+        catalog = ctx.server.catalog
+        apple_album = await catalog.album(ref[1])
+        tracks = await catalog.album_tracks(ref[1])
+        return {"album": ctx.mapper.apple_album(apple_album, tracks)}
+    album = _album(ctx, value)
     return {"album": ctx.mapper.album(album, with_songs=True)}
 
 
 @api_method("getSong")
 async def get_song(ctx: RequestContext) -> dict[str, Any]:
     """Return a song."""
-    return {"song": ctx.mapper.song(track_from_id(ctx, ctx.require("id")))}
+    return {"song": await song_entry(ctx, ctx.require("id"))}
 
 
 @api_method("getMusicDirectory")
 async def get_music_directory(ctx: RequestContext) -> dict[str, Any]:
     """Return an artist (its albums) or an album (its songs) as a directory."""
     value = ctx.require("id")
+    if (ref := apple_id(value, PREFIX_APPLE_ARTIST, PREFIX_APPLE_ALBUM)) is not None:
+        return {"directory": await _apple_directory(ctx, value, ref)}
     prefix, _ = parse_id(value, PREFIX_ARTIST, PREFIX_ALBUM)
     index = ctx.server.index
     if prefix == PREFIX_ARTIST:
@@ -115,7 +131,17 @@ async def get_genres(ctx: RequestContext) -> dict[str, Any]:
 @api_method("getArtistInfo", "getArtistInfo2")
 async def get_artist_info(ctx: RequestContext) -> dict[str, Any]:
     """Return an artist's biography and images."""
-    artist = _artist(ctx, ctx.require("id"))
+    value = ctx.require("id")
+    key = "artistInfo2" if ctx.method == "getArtistInfo2" else "artistInfo"
+    if (ref := apple_id(value, PREFIX_APPLE_ARTIST)) is not None:
+        apple_artist = await ctx.server.catalog.artist(ref[1])
+        apple_info: dict[str, Any] = {}
+        if apple_artist.metadata and apple_artist.metadata.description:
+            apple_info["biography"] = apple_artist.metadata.description
+        for image_key, size in IMAGE_SIZES:
+            apple_info[image_key] = ctx.server.image_url(ctx.request, value, size)
+        return {key: apple_info}
+    artist = _artist(ctx, value)
     info: dict[str, Any] = {}
     try:
         item = await ctx.server.mass.music.artists.get_library_item(artist.id)
@@ -125,16 +151,19 @@ async def get_artist_info(ctx: RequestContext) -> dict[str, Any]:
         info["biography"] = item.metadata.description
     if item is not None and item.mbid:
         info["musicBrainzId"] = item.mbid
-    for key, size in IMAGE_SIZES:
-        info[key] = ctx.server.image_url(ctx.request, make_id(PREFIX_ARTIST, artist.id), size)
-    key = "artistInfo2" if ctx.method == "getArtistInfo2" else "artistInfo"
+    for image_key, size in IMAGE_SIZES:
+        info[image_key] = ctx.server.image_url(ctx.request, make_id(PREFIX_ARTIST, artist.id), size)
     return {key: info}
 
 
 @api_method("getAlbumInfo", "getAlbumInfo2")
 async def get_album_info(ctx: RequestContext) -> dict[str, Any]:
     """Return an album's notes and images."""
-    album = _album(ctx, ctx.require("id"))
+    value = ctx.require("id")
+    if apple_id(value, PREFIX_APPLE_ALBUM) is not None:
+        urls = {k: ctx.server.image_url(ctx.request, value, size) for k, size in IMAGE_SIZES}
+        return {"albumInfo": urls}
+    album = _album(ctx, value)
     info: dict[str, Any] = {}
     try:
         item = await ctx.server.mass.music.albums.get_library_item(album.id)
@@ -171,6 +200,13 @@ async def get_top_songs(ctx: RequestContext) -> dict[str, Any]:
 async def get_similar_songs(ctx: RequestContext) -> dict[str, Any]:
     """Return songs like an artist, album or song: same artist first, then the same genre."""
     value = ctx.require("id")
+    key = "similarSongs2" if ctx.method == "getSimilarSongs2" else "similarSongs"
+    if (ref := apple_id(value)) is not None:
+        # an Apple Music song only has local company once it is saved
+        saved = ctx.server.catalog.library_track(ref[1]) if ref[0] == PREFIX_APPLE_TRACK else None
+        if saved is None:
+            return {key: {}}
+        value = make_id(PREFIX_TRACK, saved.id)
     prefix, _ = parse_id(value, PREFIX_ARTIST, PREFIX_ALBUM, PREFIX_TRACK)
     index = ctx.server.index
     if prefix == PREFIX_TRACK:
@@ -180,7 +216,6 @@ async def get_similar_songs(ctx: RequestContext) -> dict[str, Any]:
     else:
         seeds = index.artist_tracks(_artist(ctx, value))
     tracks = index.similar_tracks([t.id for t in seeds], ctx.get_size("count", 50))
-    key = "similarSongs2" if ctx.method == "getSimilarSongs2" else "similarSongs"
     return {key: _songs(ctx, tracks)}
 
 
@@ -258,11 +293,10 @@ async def get_now_playing(ctx: RequestContext) -> dict[str, Any]:
     now = time.time()
     entries = []
     for number, playing in enumerate(ctx.server.now_playing.values(), start=1):
-        track = ctx.server.index.get_track(playing.track_id)
         minutes = int((now - playing.since) / 60)
-        if track is None or minutes > 60:
+        if minutes > 60:
             continue
-        entry = ctx.mapper.song(track)
+        entry = dict(playing.entry)
         entry.update(
             {
                 "username": playing.username,
@@ -277,35 +311,92 @@ async def get_now_playing(ctx: RequestContext) -> dict[str, Any]:
 
 @api_method("search2", "search3")
 async def search(ctx: RequestContext) -> dict[str, Any]:
-    """Search artists, albums and songs; an empty query lists everything, page by page."""
+    """
+    Search artists, albums and songs; an empty query lists everything, page by page.
+
+    The music folder comes first; Apple Music results follow when they are enabled.
+    """
     query = ctx.get("query", "") or ""
     folder_id = ctx.folder_id()
     index = ctx.server.index
+    catalog = ctx.server.catalog
     artist_count = ctx.get_size("artistCount", DEFAULT_SEARCH_COUNT)
     album_count = ctx.get_size("albumCount", DEFAULT_SEARCH_COUNT)
     song_count = ctx.get_size("songCount", DEFAULT_SEARCH_COUNT)
     artist_offset = ctx.get_offset("artistOffset")
     album_offset = ctx.get_offset("albumOffset")
     song_offset = ctx.get_offset("songOffset")
-    artists = index.search_artists(query, folder_id)[artist_offset : artist_offset + artist_count]
-    albums = index.search_albums(query, folder_id)[album_offset : album_offset + album_count]
-    tracks = index.search_tracks(query, folder_id)
+    artists: list[Any] = list(index.search_artists(query, folder_id))
+    albums: list[Any] = list(index.search_albums(query, folder_id))
+    tracks: list[Any] = list(index.search_tracks(query, folder_id))
     if song_offset == 0 and query.strip('" '):
         tracks = await _with_heard_tracks_first(ctx, query, tracks)
+    if catalog.enabled and (apple := await catalog.search(query)) is not None:
+        local_artists = {normalize(a.name) for a in artists}
+        artists += [a for a in apple.artists if normalize(a.name) not in local_artists]
+        local_albums = {normalize(a.name) for a in albums}
+        albums += [a for a in apple.albums if normalize(a.name) not in local_albums]
+        seen: set[str] = set()
+        for track in apple.tracks:
+            if not isinstance(track, Track):
+                continue
+            item_id = catalog.apple_track_id(track)
+            if (
+                item_id is None
+                or item_id in seen
+                or catalog.is_blocked(item_id)
+                or catalog.library_track(item_id) is not None
+            ):
+                continue
+            seen.add(item_id)
+            tracks.append(track)
+    artists = artists[artist_offset : artist_offset + artist_count]
+    albums = albums[album_offset : album_offset + album_count]
     tracks = tracks[song_offset : song_offset + song_count]
     id3 = ctx.method == "search3"
+    mapper = ctx.mapper
     result: dict[str, Any] = {}
     if artists:
         result["artist"] = [
-            ctx.mapper.artist(a) if id3 else ctx.mapper.index_artist(a) for a in artists
+            (mapper.artist(a) if id3 else mapper.index_artist(a))
+            if isinstance(a, IndexedArtist)
+            else (mapper.apple_artist(a) if id3 else mapper.apple_index_artist(a))
+            for a in artists
         ]
     if albums:
         result["album"] = [
-            ctx.mapper.album(a) if id3 else ctx.mapper.album_child(a) for a in albums
+            (mapper.album(a) if id3 else mapper.album_child(a))
+            if isinstance(a, IndexedAlbum)
+            else (mapper.apple_album(a) if id3 else mapper.apple_album_child(a))
+            for a in albums
         ]
-    if tracks:
-        result["song"] = [ctx.mapper.song(t) for t in tracks]
+    songs = [
+        mapper.song(t) if isinstance(t, IndexedTrack) else mapper.apple_song(t) for t in tracks
+    ]
+    if songs := [s for s in songs if s is not None]:
+        result["song"] = songs
     return {"searchResult3" if id3 else "searchResult2": result}
+
+
+async def song_entry(ctx: RequestContext, value: str) -> dict[str, Any]:
+    """
+    Return the song entry for a library song ID or an Apple Music song ID.
+
+    :param ctx: The request context.
+    :param value: The Subsonic song ID.
+    :raises SubsonicError: Not found (70).
+    """
+    if (ref := apple_id(value, PREFIX_APPLE_TRACK)) is None:
+        return ctx.mapper.song(track_from_id(ctx, value))
+    catalog = ctx.server.catalog
+    if catalog.is_blocked(ref[1]):
+        raise SubsonicError(ERR_NOT_FOUND, "Song not found")
+    if (saved := catalog.library_track(ref[1])) is not None:
+        return ctx.mapper.song(saved)
+    entry = ctx.mapper.apple_song(await catalog.track(ref[1]))
+    if entry is None:
+        raise SubsonicError(ERR_NOT_FOUND, "Song not found")
+    return entry
 
 
 def track_from_id(ctx: RequestContext, value: str) -> IndexedTrack:
@@ -476,3 +567,32 @@ async def _with_heard_tracks_first(
     if not promoted:
         return tracks
     return promoted + [t for t in tracks if t not in promoted]
+
+
+async def _apple_directory(ctx: RequestContext, value: str, ref: tuple[str, str]) -> dict[str, Any]:
+    """
+    Return an Apple Music artist (its albums) or album (its songs) as a directory.
+
+    :param ctx: The request context.
+    :param value: The Subsonic ID.
+    :param ref: The Apple prefix and id.
+    """
+    catalog = ctx.server.catalog
+    if ref[0] == PREFIX_APPLE_ARTIST:
+        artist = await catalog.artist(ref[1])
+        albums = await catalog.artist_albums(ref[1])
+        return {
+            "child": [ctx.mapper.apple_album_child(a) for a in albums],
+            "id": value,
+            "name": artist.name,
+            "albumCount": len(albums),
+        }
+    album = ctx.mapper.apple_album(await catalog.album(ref[1]), await catalog.album_tracks(ref[1]))
+    return {
+        "child": album["song"],
+        "id": value,
+        "name": album["name"],
+        "parent": album["artistId"],
+        "coverArt": value,
+        "songCount": album["songCount"],
+    }

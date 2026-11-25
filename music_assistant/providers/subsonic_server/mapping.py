@@ -5,12 +5,18 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from .constants import ERR_NOT_FOUND
+from music_assistant_models.media_items import Album, ItemMapping
+
+from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK
+from .constants import APPLE_BIT_RATE, APPLE_DOMAIN, ERR_NOT_FOUND
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from music_assistant_models.media_items import Artist, Track
+
+    from .apple import AppleCatalog
     from .index import IndexedAlbum, IndexedArtist, IndexedTrack, LibraryIndex
 
 PREFIX_ARTIST = "ar"
@@ -83,6 +89,7 @@ class Mapper:
         index: LibraryIndex,
         image_url: Callable[[str], str],
         ratings: dict[str, int],
+        catalog: AppleCatalog | None = None,
     ) -> None:
         """
         Initialize the mapper for one request.
@@ -90,10 +97,12 @@ class Mapper:
         :param index: The library index.
         :param image_url: Returns a signed, login-free image URL for a cover art ID.
         :param ratings: The user's ratings by Subsonic ID.
+        :param catalog: The Apple Music catalogue, for Apple search results.
         """
         self.index = index
         self.image_url = image_url
         self.ratings = ratings
+        self.catalog = catalog
 
     def song(self, track: IndexedTrack) -> dict[str, Any]:
         """
@@ -300,6 +309,192 @@ class Mapper:
             "starred": iso_time(artist.timestamp_modified) if artist.favorite else None,
             "artistImageUrl": self.image_url(artist_id),
         }
+
+    def apple_song(self, track: Track) -> dict[str, Any] | None:
+        """
+        Return the song entry of an Apple Music track (the library song when it has a file).
+
+        Returns None for a track without an Apple Music id.
+
+        :param track: The track, from search, an Apple album or the library.
+        """
+        assert self.catalog is not None
+        item_id = self.catalog.apple_track_id(track)
+        if item_id is None or self.catalog.is_blocked(item_id):
+            return None
+        if (saved := self.catalog.library_track(item_id)) is not None:
+            return self.song(saved)
+        album = track.album if isinstance(track.album, Album) else None
+        album_ref = self._apple_ref(track.album) if track.album is not None else None
+        artists = [r for r in (self._apple_ref(a) for a in track.artists) if r is not None]
+        song_id = make_id(PREFIX_APPLE_TRACK, item_id)
+        album_id = make_id(PREFIX_APPLE_ALBUM, album_ref[0]) if album_ref else None
+        genres = sorted(track.metadata.genres or []) if track.metadata else []
+        title = display_name(track.name, track.version)
+        album_name = album_ref[1] if album_ref else ""
+        artist_name = "; ".join(a[1] for a in artists)
+        return {
+            "id": song_id,
+            "parent": album_id,
+            "isDir": False,
+            "title": title,
+            "album": album_name or None,
+            "artist": artist_name,
+            "track": track.track_number or None,
+            "year": album.year if album else None,
+            "genre": genres[0] if genres else None,
+            "coverArt": album_id or song_id,
+            "size": int(track.duration * APPLE_BIT_RATE * 1000 / 8),
+            "contentType": "audio/mp4",
+            "suffix": "m4a",
+            "duration": track.duration,
+            "bitRate": APPLE_BIT_RATE,
+            "path": f"Apple Music/{artist_name}/{album_name}/{title}.m4a",
+            "discNumber": (track.disc_number or 1) if album_id else None,
+            "albumId": album_id,
+            "artistId": make_id(PREFIX_APPLE_ARTIST, artists[0][0]) if artists else None,
+            "type": "music",
+            "userRating": self.ratings.get(song_id),
+            "bpm": 0,
+            "comment": "",
+            "sortName": (track.sort_name or track.name).casefold(),
+            "mediaType": "song",
+            "musicBrainzId": "",
+            "isrc": [],
+            "genres": [{"name": g} for g in genres],
+            "replayGain": {},
+            "channelCount": 2,
+            "samplingRate": 44100,
+            "bitDepth": 16,
+            "moods": [],
+            "artists": [{"id": make_id(PREFIX_APPLE_ARTIST, a[0]), "name": a[1]} for a in artists],
+            "displayArtist": artist_name,
+            "albumArtists": [],
+            "displayAlbumArtist": "",
+            "contributors": [],
+            "displayComposer": "",
+            "explicitStatus": "",
+            "groupings": [],
+            "works": [],
+            "movements": [],
+        }
+
+    def apple_album(self, album: Album, tracks: list[Track] | None = None) -> dict[str, Any]:
+        """
+        Return the albumID3 entry of an Apple Music album.
+
+        :param album: The album.
+        :param tracks: The album's tracks to include as songs (none when omitted).
+        """
+        assert self.catalog is not None
+        item_id = self.catalog.apple_item_id(album) or album.item_id
+        album_id = make_id(PREFIX_APPLE_ALBUM, item_id)
+        artists = [r for r in (self._apple_ref(a) for a in album.artists) if r is not None]
+        songs = [s for s in (self.apple_song(t) for t in tracks or []) if s is not None]
+        genres = sorted(album.metadata.genres or []) if album.metadata else []
+        entry: dict[str, Any] = {
+            "id": album_id,
+            "name": display_name(album.name, album.version),
+            "artist": "; ".join(a[1] for a in artists),
+            "artistId": make_id(PREFIX_APPLE_ARTIST, artists[0][0]) if artists else None,
+            "coverArt": album_id,
+            "songCount": len(songs),
+            "duration": sum(int(s["duration"] or 0) for s in songs),
+            "year": album.year,
+            "genre": genres[0] if genres else None,
+            "userRating": self.ratings.get(album_id, 0),
+            "genres": [{"name": g} for g in genres],
+            "musicBrainzId": "",
+            "isCompilation": str(album.album_type) == "compilation",
+            "sortName": (album.sort_name or album.name).casefold(),
+            "discTitles": [],
+            "originalReleaseDate": {},
+            "releaseDate": {"year": album.year} if album.year else {},
+            "releaseTypes": [],
+            "recordLabels": [],
+            "moods": [],
+            "artists": [{"id": make_id(PREFIX_APPLE_ARTIST, a[0]), "name": a[1]} for a in artists],
+            "displayArtist": "; ".join(a[1] for a in artists),
+            "explicitStatus": "",
+            "version": album.version or "",
+        }
+        if tracks is not None:
+            entry["song"] = songs
+        return entry
+
+    def apple_album_child(self, album: Album) -> dict[str, Any]:
+        """
+        Return an Apple Music album as a folder-style "child" entry (search2, directories).
+
+        :param album: The album.
+        """
+        entry = self.apple_album(album)
+        return {
+            "id": entry["id"],
+            "parent": entry["artistId"],
+            "isDir": True,
+            "title": entry["name"],
+            "name": entry["name"],
+            "album": entry["name"],
+            "artist": entry["artist"],
+            "year": entry["year"],
+            "genre": entry["genre"],
+            "coverArt": entry["coverArt"],
+            "artistId": entry["artistId"],
+            "songCount": 0,
+            "sortName": entry["sortName"],
+            "mediaType": "album",
+            "artists": entry["artists"],
+            "displayArtist": entry["displayArtist"],
+        }
+
+    def apple_artist(self, artist: Artist, albums: list[Album] | None = None) -> dict[str, Any]:
+        """
+        Return the artistID3 entry of an Apple Music artist.
+
+        :param artist: The artist.
+        :param albums: The artist's albums to include (none when omitted).
+        """
+        assert self.catalog is not None
+        artist_id = make_id(
+            PREFIX_APPLE_ARTIST, self.catalog.apple_item_id(artist) or artist.item_id
+        )
+        entry: dict[str, Any] = {
+            "id": artist_id,
+            "name": artist.name,
+            "coverArt": artist_id,
+            "albumCount": len(albums) if albums is not None else 0,
+            "artistImageUrl": self.image_url(artist_id),
+            "musicBrainzId": "",
+            "sortName": (artist.sort_name or artist.name).casefold(),
+            "roles": [],
+        }
+        if albums is not None:
+            entry["album"] = [self.apple_album(a) for a in albums]
+        return entry
+
+    def apple_index_artist(self, artist: Artist) -> dict[str, Any]:
+        """
+        Return an Apple Music artist as a folder-style index entry (search2).
+
+        :param artist: The artist.
+        """
+        entry = self.apple_artist(artist)
+        return {k: entry[k] for k in ("id", "name", "coverArt", "artistImageUrl")}
+
+    def _apple_ref(self, item: Album | Artist | ItemMapping) -> tuple[str, str] | None:
+        """
+        Return (Apple Music id, name) of an album or artist reference, if it has one.
+
+        :param item: The album or artist (or its short reference).
+        """
+        assert self.catalog is not None
+        if isinstance(item, ItemMapping):
+            if item.provider == "library" or not item.provider.startswith(APPLE_DOMAIN):
+                return None
+            return item.item_id, item.name
+        item_id = self.catalog.apple_item_id(item)
+        return (item_id, item.name) if item_id else None
 
     def _artists(self, artist_ids: list[int]) -> list[dict[str, Any]]:
         """

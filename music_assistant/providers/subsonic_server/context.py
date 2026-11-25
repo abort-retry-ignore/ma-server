@@ -35,9 +35,9 @@ API_METHODS: dict[str, ApiMethod] = {}
 
 @dataclass
 class NowPlaying:
-    """A track a client reported as playing."""
+    """A song a client reported as playing."""
 
-    track_id: int
+    entry: dict[str, Any]
     username: str
     client: str
     since: float
@@ -77,7 +77,9 @@ class RequestContext:
     def mapper(self) -> Mapper:
         """Return the entry mapper for this request."""
         if self._mapper is None:
-            self._mapper = Mapper(self.server.index, self.image_url, self.ratings)
+            self._mapper = Mapper(
+                self.server.index, self.image_url, self.ratings, self.server.catalog
+            )
         return self._mapper
 
     @property

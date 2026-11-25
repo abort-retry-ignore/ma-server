@@ -2475,6 +2475,8 @@
   "provider.storytel.media.recommendations.recommended_podcasts.name": "Recommended Podcasts",
   "provider.subsonic_scrobble.manifest.description": "Scrobbles tracks played in Music Assistant to your local Subsonic server for history and stats.",
   "provider.subsonic_server.config_categories.subsonic_logins": "Subsonic logins",
+  "provider.subsonic_server.config_entries.apple_search.description": "Search results also list Apple Music songs, albums and artists. Playing a song that isn't saved yet saves it first, which takes a few seconds; after that it is an ordinary file in your music folder.",
+  "provider.subsonic_server.config_entries.apple_search.label": "Include Apple Music in search",
   "provider.subsonic_server.config_entries.bind_ip.description": "The network address to listen on. 0.0.0.0 listens on every network, including Tailscale. Never forward this port on your router.",
   "provider.subsonic_server.config_entries.bind_ip.label": "Listen address",
   "provider.subsonic_server.config_entries.log_requests.description": "Write each Subsonic call (without passwords) to the Music Assistant log. Useful while testing an app; errors are always logged.",

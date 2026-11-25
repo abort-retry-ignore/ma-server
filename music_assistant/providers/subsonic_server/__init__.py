@@ -20,6 +20,7 @@ from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.filesystem_local import LocalFileSystemProvider
 
 from .constants import (
+    CONF_APPLE_SEARCH,
     CONF_BIND_IP,
     CONF_LOG_REQUESTS,
     CONF_MUSIC_FOLDERS,
@@ -101,6 +102,11 @@ class SubsonicServerProvider(PluginProvider):
                 options=folders,
                 default_value=[],
                 required=False,
+            ),
+            ConfigEntry(
+                key=CONF_APPLE_SEARCH,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=True,
             ),
             ConfigEntry(
                 key=CONF_LOG_REQUESTS,

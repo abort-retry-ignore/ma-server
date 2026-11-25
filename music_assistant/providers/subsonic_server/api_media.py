@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -13,9 +14,11 @@ from aiohttp import web
 from music_assistant_models.errors import MusicAssistantError
 
 from .api_library import track_from_id
+from .apple import PREFIX_APPLE_TRACK, apple_id
 from .constants import ERR_NOT_FOUND
 from .context import RequestContext, api_method
 from .index import normalize
+from .mapping import PREFIX_TRACK, make_id
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
@@ -29,7 +32,16 @@ LRC_OFFSET = re.compile(r"^\[offset:\s*([+-]?\d+)\s*\]$", re.IGNORECASE)
 @api_method("stream", "download")
 async def stream(ctx: RequestContext) -> web.StreamResponse:
     """Send a song's file as it is, with range support (like Navidrome's raw format)."""
-    track = track_from_id(ctx, ctx.require("id"))
+    value = ctx.require("id")
+    if (ref := apple_id(value, PREFIX_APPLE_TRACK)) is not None:
+        catalog = ctx.server.catalog
+        if catalog.is_blocked(ref[1]):
+            raise SubsonicError(ERR_NOT_FOUND, "Song not found")
+        saved = catalog.library_track(ref[1])
+        if saved is None:
+            return await _apple_file(ctx, ref[1])
+        value = make_id(PREFIX_TRACK, saved.id)
+    track = track_from_id(ctx, value)
     path = _checked_path(ctx, track)
     asked_format = ctx.get("format")
     max_bit_rate = ctx.get_int("maxBitRate", 0) or 0
@@ -67,7 +79,13 @@ async def get_avatar(ctx: RequestContext) -> web.StreamResponse:  # noqa: ARG001
 @api_method("getLyricsBySongId")
 async def get_lyrics_by_song_id(ctx: RequestContext) -> dict[str, Any]:
     """Return a song's lyrics, synced line by line when an LRC file or LRC lyrics exist."""
-    track = track_from_id(ctx, ctx.require("id"))
+    value = ctx.require("id")
+    if (ref := apple_id(value, PREFIX_APPLE_TRACK)) is not None:
+        # lyrics come with the saved file
+        if (saved := ctx.server.catalog.library_track(ref[1])) is None:
+            return {"lyricsList": {}}
+        value = make_id(PREFIX_TRACK, saved.id)
+    track = track_from_id(ctx, value)
     lyrics = await _lyrics(ctx, track)
     if lyrics is None:
         return {"lyricsList": {}}
@@ -100,6 +118,31 @@ async def get_lyrics(ctx: RequestContext) -> dict[str, Any]:
         text = "\n".join(str(line["value"]) for line in lyrics[1])
         return {"lyrics": {"artist": ctx.get("artist"), "title": track.name, "value": text}}
     return {"lyrics": {"value": ""}}
+
+
+async def _apple_file(ctx: RequestContext, item_id: str) -> web.StreamResponse:
+    """
+    Send an Apple Music song, saving it first when it has no file yet.
+
+    :param ctx: The request context.
+    :param item_id: The Apple Music track id.
+    """
+    catalog = ctx.server.catalog
+    started = time.monotonic()
+    path = await catalog.ensure_file(item_id, ctx.user_id)
+    waited = time.monotonic() - started
+    if waited > 0.5:
+        ctx.note = f" (Apple Music song saved first, waited {waited:.1f} s)"
+    track = await catalog.track(item_id)
+    headers = {
+        "Content-Type": "audio/mp4",
+        "X-Content-Duration": f"{float(track.duration):.2f}",
+        "Accept-Ranges": "bytes",
+    }
+    if ctx.method == "download":
+        name = urllib.parse.quote(f"{track.name}.m4a")
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{name}"
+    return web.FileResponse(path, headers=headers)
 
 
 def _checked_path(ctx: RequestContext, track: IndexedTrack) -> str:
