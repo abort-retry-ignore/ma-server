@@ -129,6 +129,9 @@ async def star(ctx: RequestContext) -> dict[str, Any]:
     for value in values:
         prefix, item_id = parse_id(value, PREFIX_ARTIST, PREFIX_ALBUM, PREFIX_TRACK)
         media_type = MEDIA_TYPES[prefix]
+        if item_id < 0:
+            ctx.note = " (an [Unknown Album] can't be a favourite, ignored)"
+            continue
         try:
             if favorite:
                 await music.add_item_to_favorites(create_uri(media_type, "library", str(item_id)))

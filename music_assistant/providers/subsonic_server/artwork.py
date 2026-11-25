@@ -7,9 +7,10 @@ import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
+from music_assistant_models.enums import ImageType
 from music_assistant_models.errors import MusicAssistantError
 
 from .mapping import PREFIX_ALBUM, PREFIX_ARTIST, PREFIX_PLAYLIST, PREFIX_TRACK, parse_id
@@ -18,7 +19,6 @@ from .responses import SubsonicError
 if TYPE_CHECKING:
     from music_assistant_models.media_items import MediaItemImage
 
-    from .index import IndexedAlbum
     from .server import SubsonicServer
 
 COVER_FILE_NAMES = ("cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "album.jpg")
@@ -62,16 +62,18 @@ class Artwork:
             prefix, item_id = parse_id(cover_id)
         except SubsonicError:
             return None
-        source = await self._find_source(prefix, item_id)
-        if source is None:
+        data: bytes | None = None
+        for path, provider in await self._sources(prefix, item_id):
+            try:
+                thumb = await self.mass.metadata.get_thumbnail(path, provider, size=size or None)
+            except (MusicAssistantError, OSError) as err:
+                self.server.logger.debug("Cover art for %s not at %s: %s", cover_id, path, err)
+                continue
+            if isinstance(thumb, bytes) and thumb:
+                data = thumb
+                break
+        if data is None:
             return None
-        path, provider = source
-        try:
-            data = await self.mass.metadata.get_thumbnail(path, provider, size=size or None)
-        except (MusicAssistantError, OSError) as err:
-            self.server.logger.debug("No cover art for %s: %s", cover_id, err)
-            return None
-        assert isinstance(data, bytes)
         image = Image(data, _content_type(data), f'"{hashlib.sha1(data).hexdigest()[:16]}"')
         self._cache[key] = image
         if len(self._cache) > MAX_CACHED_IMAGES:
@@ -90,57 +92,70 @@ class Artwork:
             return web.Response(status=304, headers=headers)
         return web.Response(body=image.data, content_type=image.content_type, headers=headers)
 
-    async def _find_source(self, prefix: str, item_id: int) -> tuple[str, str] | None:
+    async def _sources(self, prefix: str, item_id: int) -> list[tuple[str, str]]:
         """
-        Return the (path, provider) of the image for a library item.
+        Return the (path, provider) image candidates for an item, best first.
+
+        MA's own images come first; for albums and songs the folder's cover file and the
+        artwork embedded in the audio file follow, for when MA's image is gone.
 
         :param prefix: The ID type prefix.
         :param item_id: The library id.
         """
         music = self.mass.music
         index = self.server.index
-        image: MediaItemImage | None = None
+        if prefix == PREFIX_ALBUM:
+            return await self._album_sources(item_id)
+        if prefix == PREFIX_TRACK:
+            sources = await self._library_images(music.tracks, item_id)
+            track = index.tracks.get(item_id)
+            if track is not None and track.album_id is not None:
+                sources += await self._album_sources(track.album_id)
+            if track is not None:
+                sources.append((track.rel_path, track.provider_instance))
+            return list(dict.fromkeys(sources))
+        if prefix == PREFIX_ARTIST:
+            return await self._library_images(music.artists, item_id)
+        if prefix == PREFIX_PLAYLIST:
+            return await self._library_images(music.playlists, item_id)
+        return []
+
+    async def _album_sources(self, album_id: int) -> list[tuple[str, str]]:
+        """
+        Return the image candidates for an album.
+
+        :param album_id: The library album id (negative for an "[Unknown Album]").
+        """
+        sources = []
+        if album_id > 0:
+            sources += await self._library_images(self.mass.music.albums, album_id)
+        album = self.server.index.albums.get(album_id)
+        tracks = self.server.index.album_tracks(album) if album is not None else []
+        if tracks:
+            track = tracks[0]
+            folder = os.path.dirname(track.rel_path)
+            abs_folder = os.path.dirname(track.abs_path)
+            for name in COVER_FILE_NAMES:
+                if (Path(abs_folder) / name).is_file():
+                    sources.append((os.path.join(folder, name), track.provider_instance))
+                    break
+            sources.append((track.rel_path, track.provider_instance))
+        return sources
+
+    @staticmethod
+    async def _library_images(controller: Any, item_id: int) -> list[tuple[str, str]]:
+        """
+        Return the thumb images MA has for a library item.
+
+        :param controller: The MA media controller for the item's type.
+        :param item_id: The library id.
+        """
         try:
-            if prefix == PREFIX_ALBUM:
-                image = (await music.albums.get_library_item(item_id)).image
-                if image is None and (album := index.albums.get(item_id)) is not None:
-                    return self._folder_cover(album)
-            elif prefix == PREFIX_TRACK:
-                image = (await music.tracks.get_library_item(item_id)).image
-                track = index.tracks.get(item_id)
-                if image is None and track is not None and track.album_id is not None:
-                    album = index.albums.get(track.album_id)
-                    album_image = (await music.albums.get_library_item(track.album_id)).image
-                    if album_image is not None:
-                        image = album_image
-                    elif album is not None:
-                        return self._folder_cover(album)
-            elif prefix == PREFIX_ARTIST:
-                image = (await music.artists.get_library_item(item_id)).image
-            elif prefix == PREFIX_PLAYLIST:
-                image = (await music.playlists.get_library_item(item_id)).image
+            item = await controller.get_library_item(item_id)
         except MusicAssistantError:
-            return None
-        if image is None:
-            return None
-        return image.path, image.provider
-
-    def _folder_cover(self, album: IndexedAlbum) -> tuple[str, str] | None:
-        """
-        Return a cover image file next to the album's first track, if there is one.
-
-        :param album: The album.
-        """
-        tracks = self.server.index.album_tracks(album)
-        if not tracks:
-            return None
-        track = tracks[0]
-        folder = os.path.dirname(track.rel_path)
-        abs_folder = os.path.dirname(track.abs_path)
-        for name in COVER_FILE_NAMES:
-            if (Path(abs_folder) / name).is_file():
-                return os.path.join(folder, name), track.provider_instance
-        return None
+            return []
+        images: list[MediaItemImage] = list(item.metadata.images or []) if item.metadata else []
+        return [(i.path, i.provider) for i in images if i.type == ImageType.THUMB]
 
 
 def _content_type(data: bytes) -> str:

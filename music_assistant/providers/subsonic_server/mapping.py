@@ -41,11 +41,14 @@ def parse_id(value: str | None, *allowed: str) -> tuple[str, int]:
     :raises SubsonicError: Not found (70) for a malformed ID or a type not accepted here.
     """
     prefix, _, number = (value or "").partition("-")
-    if not number.isdigit() or (allowed and prefix not in allowed):
+    # "[Unknown Album]" albums have negative ids ("al--204")
+    negative = prefix == PREFIX_ALBUM and number.startswith("-")
+    digits = number[1:] if negative else number
+    if not digits.isdigit() or (allowed and prefix not in allowed):
         raise SubsonicError(ERR_NOT_FOUND, "Item not found")
     if prefix not in (PREFIX_ARTIST, PREFIX_ALBUM, PREFIX_TRACK, PREFIX_PLAYLIST):
         raise SubsonicError(ERR_NOT_FOUND, "Item not found")
-    return prefix, int(number)
+    return prefix, -int(digits) if negative else int(digits)
 
 
 def iso_time(timestamp: float | None) -> str | None:

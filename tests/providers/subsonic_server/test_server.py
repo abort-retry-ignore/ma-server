@@ -7,6 +7,7 @@ caches publish.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import pathlib
 import shutil
@@ -180,6 +181,47 @@ def _make_library(folder: pathlib.Path) -> None:
         1,
         "Rock",
     )
+    _make_unknown_album_track(folder / "Music Assistant Cache" / "Enur" / "Unknown Album")
+
+
+def _make_unknown_album_track(folder: pathlib.Path) -> None:
+    """
+    Write a track without an album tag and with embedded cover art, like a YouTube download.
+
+    :param folder: The folder for the file.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=500:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=64x64",
+            "-frames:v",
+            "1",
+            "-map",
+            "0:a",
+            "-map",
+            "1:v",
+            "-c:v",
+            "mjpeg",
+            "-disposition:v",
+            "attached_pic",
+            "-metadata",
+            "title=Calabria 2008",
+            "-metadata",
+            "artist=Enur",
+            str(folder / "Calabria 2008.flac"),
+        ],
+        check=True,
+    )
 
 
 @pytest.fixture
@@ -201,12 +243,22 @@ async def server(tmp_path: pathlib.Path) -> AsyncGenerator[Server]:
         config = await mass.config._create_provider_instance(
             "subsonic_server", {"port": 0, "bind_ip": "127.0.0.1"}
         )
+        first = mass.get_provider(config.instance_id)
         await mass.config.save_provider_config(
             "subsonic_server",
             {"port": 0, "bind_ip": "127.0.0.1", f"password_{user.user_id}": PASSWORD},
             instance_id=config.instance_id,
         )
-        provider = cast("SubsonicServerProvider", mass.get_provider(config.instance_id))
+        # saving the settings reloads the plugin a moment later: wait for the new instance
+        provider = cast("SubsonicServerProvider", first)
+        for _ in range(100):
+            loaded = mass.get_provider(config.instance_id)
+            if loaded is not None and loaded is not first:
+                provider = cast("SubsonicServerProvider", loaded)
+                if provider.server is not None and provider.server.port:
+                    break
+            await asyncio.sleep(0.05)
+        assert provider is not first
         assert provider.server is not None
         await provider.server.index.rebuild()
         async with aiohttp.ClientSession() as session:
@@ -243,7 +295,7 @@ async def test_browse_artist_album_and_song(server: Server) -> None:
     """Artists, albums and songs from the folder come out with Navidrome's fields."""
     artists = (await server.call("getArtists"))["artists"]
     names = [a["name"] for group in artists["index"] for a in group["artist"]]
-    assert names == ["Basil Poledouris", "Chrome Nine"]
+    assert names == ["Basil Poledouris", "Chrome Nine", "Enur"]
     assert artists["ignoredArticles"].startswith("The El La")
     basil = next(
         a for g in artists["index"] for a in g["artist"] if a["name"] == "Basil Poledouris"
@@ -328,13 +380,13 @@ async def test_search_lists_and_empty_query(server: Server) -> None:
     found = (await server.call("search3", query="anvil"))["searchResult3"]
     assert sorted(s["title"] for s in found["song"]) == ["Anvil of Chrome", "Anvil of Crom"]
     everything = (await server.call("search3", query='""', songCount=10))["searchResult3"]
-    assert len(everything["song"]) == 3
-    paged = (await server.call("search3", query="", songCount=2, songOffset=2))["searchResult3"]
-    assert len(paged["song"]) == 1
+    assert len(everything["song"]) == 4
+    paged = (await server.call("search3", query="", songCount=3, songOffset=2))["searchResult3"]
+    assert len(paged["song"]) == 2
     nothing = await server.call("search3", query="zzzz")
     assert nothing["searchResult3"] == {}
     newest = (await server.call("getAlbumList2", type="newest", size=10))["albumList2"]["album"]
-    assert len(newest) == 2
+    assert len(newest) == 3
     by_genre = (await server.call("getSongsByGenre", genre="Soundtrack"))["songsByGenre"]["song"]
     assert len(by_genre) == 2
     genres = {
@@ -440,7 +492,7 @@ async def test_user_folders_scan_and_stubs(server: Server) -> None:
     assert user["shareRole"] is False
     assert user["folder"] == [1]
     status = (await server.call("getScanStatus"))["scanStatus"]
-    assert status["count"] == 3
+    assert status["count"] == 4
     assert (await server.call("getShares"))["shares"] == {}
     assert (await server.call("getPodcasts"))["podcasts"] == {}
     extensions = (await server.call("getOpenSubsonicExtensions"))["openSubsonicExtensions"]
@@ -454,3 +506,33 @@ async def test_index_follows_library_changes(server: Server) -> None:
     assert server.provider.server is not None
     await server.provider.server.index.rebuild()
     assert (await server.call("getSong", id=song["id"]))["error"]["code"] == 70
+
+
+async def test_track_without_album_gets_an_unknown_album(server: Server) -> None:
+    """A file without an album tag is browsable through an "[Unknown Album]", like Navidrome."""
+    song = (await server.call("search3", query="calabria"))["searchResult3"]["song"][0]
+    assert song["album"] == "[Unknown Album]"
+    album = (await server.call("getAlbum", id=song["albumId"]))["album"]
+    assert [s["id"] for s in album["song"]] == [song["id"]]
+    artist = (await server.call("getArtist", id=song["artistId"]))["artist"]
+    assert artist["name"] == "Enur"
+    assert [a["id"] for a in artist["album"]] == [song["albumId"]]
+    art = await server.get("getCoverArt", id=album["coverArt"], size=32)
+    assert art.status == 200
+    assert art.headers["Content-Type"].startswith("image/")
+    assert (await server.call("star", albumId=song["albumId"]))["status"] == "ok"
+
+
+async def test_favourite_set_in_ma_shows_up_in_the_app(server: Server) -> None:
+    """A favourite set in MA's own app reaches Subsonic apps after the index follows the change."""
+    song = (await server.call("search3", query="riddle"))["searchResult3"]["song"][0]
+    track = await server.mass.music.tracks.get_library_item(int(song["id"].split("-")[1]))
+    await server.mass.music.add_item_to_favorites(track)
+    starred: list[str] = []
+    for _ in range(50):
+        starred2 = (await server.call("getStarred2"))["starred2"]
+        starred = [s["id"] for s in starred2.get("song", [])]
+        if starred:
+            break
+        await asyncio.sleep(0.2)
+    assert starred == [song["id"]]

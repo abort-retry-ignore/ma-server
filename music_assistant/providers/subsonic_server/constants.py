@@ -23,6 +23,9 @@ DEFAULT_BIND_IP: Final = "0.0.0.0"
 # the parameters that carry credentials; never logged
 SECRET_PARAMS: Final = frozenset({"u", "p", "t", "s", "apiKey"})
 
+# the album Navidrome shows for tracks without an album
+UNKNOWN_ALBUM: Final = "[Unknown Album]"
+
 # Navidrome's default list of articles ignored when indexing artists
 IGNORED_ARTICLES: Final = "The El La Los Las Le Les Os As O A"
 

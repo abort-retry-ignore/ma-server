@@ -25,7 +25,7 @@ from music_assistant_models.helpers import create_uri
 from music_assistant.helpers.json import json_loads
 from music_assistant.providers.filesystem_local.helpers import get_absolute_path
 
-from .constants import CONTENT_TYPES
+from .constants import CONTENT_TYPES, UNKNOWN_ALBUM
 
 if TYPE_CHECKING:
     import logging
@@ -476,6 +476,7 @@ class LibraryIndex:
             album.artist_ids = [a for a in artist_ids if a in artists]
             for artist_id in album.artist_ids:
                 _append_unique(artists[artist_id].album_ids, album_id)
+        _add_unknown_albums(tracks, albums, artists)
         for album in albums.values():
             if not album.artist_ids and album.track_ids:
                 album.artist_ids = list(tracks[album.track_ids[0]].artist_ids)
@@ -488,6 +489,51 @@ class LibraryIndex:
         for artist in artists.values():
             artist.search_text = normalize(artist.name)
         return tracks, albums, artists
+
+
+def _add_unknown_albums(
+    tracks: dict[int, IndexedTrack],
+    albums: dict[int, IndexedAlbum],
+    artists: dict[int, IndexedArtist],
+) -> None:
+    """
+    Put tracks without an album into an "[Unknown Album]" per artist, as Navidrome does.
+
+    These albums don't exist in MA's library; their id is the negated artist id.
+
+    :param tracks: The indexed tracks.
+    :param albums: The indexed albums (extended in place).
+    :param artists: The indexed artists (extended in place).
+    """
+    orphans: dict[int, list[IndexedTrack]] = {}
+    for track in tracks.values():
+        if track.album_id is None and track.artist_ids:
+            orphans.setdefault(track.artist_ids[0], []).append(track)
+    for artist_id, members in orphans.items():
+        members.sort(key=lambda t: (t.track_number, t.sort_name, t.id))
+        album_id = -artist_id
+        albums[album_id] = IndexedAlbum(
+            id=album_id,
+            name=UNKNOWN_ALBUM,
+            sort_name=UNKNOWN_ALBUM.casefold(),
+            version="",
+            album_type="",
+            year=None,
+            favorite=False,
+            play_count=sum(t.play_count for t in members),
+            last_played=max(t.last_played for t in members),
+            timestamp_added=min(t.timestamp_added for t in members),
+            timestamp_modified=max(t.timestamp_modified for t in members),
+            genres=list(dict.fromkeys(g for t in members for g in t.genres)),
+            has_image=False,
+            artist_ids=[artist_id],
+            track_ids=[t.id for t in members],
+        )
+        for track in members:
+            track.album_id = album_id
+            for other in track.artist_ids:
+                _append_unique(artists[other].track_album_ids, album_id)
+        _append_unique(artists[artist_id].album_ids, album_id)
 
 
 def normalize(text: str) -> str:
