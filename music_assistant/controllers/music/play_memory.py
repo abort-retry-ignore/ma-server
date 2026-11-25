@@ -185,9 +185,25 @@ class PlayMemory:
 
         :param item: The track to check.
         """
+        return self.is_blocked_uri(_item_uris(item))
+
+    def is_blocked_uri(self, uris: Iterable[str]) -> bool:
+        """
+        Return whether any of the given track uris was marked as wrong.
+
+        :param uris: The uris one track is known by (library and provider uris).
+        """
         if not self._blocked:
             return False
-        return any(uri in self._blocked for uri in _item_uris(item))
+        return any(uri in self._blocked for uri in uris)
+
+    async def heard_uris_matching(self, search_query: str) -> list[str]:
+        """
+        Return the uris of heard tracks whose name is a close variant of the query, best first.
+
+        :param search_query: The search query.
+        """
+        return [heard.uri for heard in await self._match(search_query)]
 
     async def adjust_search_results(
         self,

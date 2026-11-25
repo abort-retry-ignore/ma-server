@@ -1,0 +1,38 @@
+{
+  "config_entries": {
+    "port": {
+      "label": "Port",
+      "description": "The port Subsonic apps connect to. In the app, enter http://<this server>:<port> as the server address."
+    },
+    "bind_ip": {
+      "label": "Listen address",
+      "description": "The network address to listen on. 0.0.0.0 listens on every network, including Tailscale. Never forward this port on your router."
+    },
+    "music_folders": {
+      "label": "Music folders",
+      "description": "The local music folders Subsonic apps can see. Leave empty for all of them."
+    },
+    "log_requests": {
+      "label": "Log every request",
+      "description": "Write each Subsonic call (without passwords) to the Music Assistant log. Useful while testing an app; errors are always logged."
+    },
+    "server_type": {
+      "label": "Server type reported to apps",
+      "description": "Some apps enable extra features for Navidrome. Those features may use Navidrome's own web API, which this server doesn't have.",
+      "options": {
+        "music-assistant": "Music Assistant",
+        "navidrome": "Navidrome"
+      }
+    },
+    "subsonic_password": {
+      "label": "Subsonic password for {0} (login: {1})",
+      "description": "Leave empty to give this user no Subsonic access. Use a new password made just for Subsonic: apps send it with every request and some store it unencrypted."
+    }
+  },
+  "config_categories": {
+    "subsonic_logins": "Subsonic logins"
+  },
+  "manifest": {
+    "description": "Lets Subsonic apps (Arpeggi, Symfonium, play:Sub, ...) browse and play the music files in your library, like a Navidrome server."
+  }
+}

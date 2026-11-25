@@ -1,0 +1,13 @@
+{
+  "type": "plugin",
+  "domain": "subsonic_server",
+  "stage": "experimental",
+  "name": "Subsonic API server",
+  "description": "Lets Subsonic apps (Arpeggi, Symfonium, play:Sub, ...) browse and play the music files in your library, like a Navidrome server.",
+  "codeowners": ["@abort-retry-ignore"],
+  "documentation": "",
+  "multi_instance": false,
+  "builtin": false,
+  "requirements": [],
+  "icon": "server-network"
+}

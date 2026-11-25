@@ -1,6 +1,21 @@
 # Subsonic API server for Music Assistant (fork) — design
 
-Status: design, nothing built yet. Written 2026-11-26.
+Status: phase 1 built on branch `subsonic` (2026-11-26) as `music_assistant/providers/subsonic_server/`.
+
+What was built differs from the plan below in a few places:
+
+- **More of the API in phase 1:**
+  - ratings (`setRating`, `userRating`, the `highest` list), stored in `subsonic_server.db`;
+  - play queue sync, both the plain and the index-based calls;
+  - `getUsers`, `getSimilarSongs`/`getSimilarSongs2`;
+  - editing MA's own playlists (`createPlaylist`, `updatePlaylist`, `deletePlaylist`).
+- **What isn't there:** renaming a playlist and playlist comments are ignored (the log notes it).
+  Transcoding, `apiKey` login and Apple Music / YouTube Music playlists are still for later.
+- **Where the reply shapes come from:** Navidrome 0.64 replies captured on the home server. A
+  field-by-field comparison against MA's replies leaves no fields missing apart from data the test
+  library doesn't have.
+- **Tests:** `tests/providers/subsonic_server/` has 22 tests. The full-server ones generate FLAC
+  files with ffmpeg, scan them with the filesystem provider and call the API over HTTP.
 
 ## 1. Goal
 
