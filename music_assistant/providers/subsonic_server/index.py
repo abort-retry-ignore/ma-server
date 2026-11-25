@@ -409,17 +409,17 @@ class LibraryIndex:
         )
         mappings = await _all_track_mappings(db)
         loudness = await _loudness_by_mapping(db)
-        tracks: dict[int, IndexedTrack] = {}
+        candidates: dict[int, list[IndexedTrack]] = {}
         for row in rows:
             track_id = int(row["item_id"])
             folder = by_instance.get(row["provider_instance"])
-            if folder is None or track_id in tracks:
+            if folder is None:
                 continue
             track = _track_from_row(row, folder, mappings.get(track_id, []), loudness)
             if track is not None:
-                tracks[track_id] = track
-        await asyncio.to_thread(_stat_files, list(tracks.values()))
-        tracks = {k: t for k, t in tracks.items() if t.size >= 0}
+                candidates.setdefault(track_id, []).append(track)
+        # a track can have several files (e.g. one per release); use the first that exists
+        tracks = await asyncio.to_thread(pick_existing_files, candidates)
 
         album_links: dict[int, list[tuple[int, int, int]]] = {}
         for row in await db.get_rows_from_query(
@@ -663,20 +663,24 @@ def _track_from_row(
     )
 
 
-def _stat_files(tracks: list[IndexedTrack]) -> None:
+def pick_existing_files(candidates: dict[int, list[IndexedTrack]]) -> dict[int, IndexedTrack]:
     """
-    Fill in each track's file size and modification time; size -1 marks a missing file.
+    Return per track the first candidate whose file exists, with its size and time filled in.
 
-    :param tracks: The tracks.
+    :param candidates: The file versions of each track, in preference order.
     """
-    for track in tracks:
-        try:
-            stat = Path(track.abs_path).stat()
-        except OSError:
-            track.size = -1
-            continue
-        track.size = stat.st_size
-        track.mtime = stat.st_mtime
+    result: dict[int, IndexedTrack] = {}
+    for track_id, versions in candidates.items():
+        for track in versions:
+            try:
+                stat = Path(track.abs_path).stat()
+            except OSError:
+                continue
+            track.size = stat.st_size
+            track.mtime = stat.st_mtime
+            result[track_id] = track
+            break
+    return result
 
 
 async def _all_track_mappings(db: Any) -> dict[int, list[tuple[str, str, str]]]:

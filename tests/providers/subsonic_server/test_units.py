@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import pathlib
 from typing import Any
 
 import pytest
@@ -18,7 +19,12 @@ from music_assistant.providers.subsonic_server.constants import (
     ERR_WRONG_CREDENTIALS,
     MAX_FAILED_LOGINS,
 )
-from music_assistant.providers.subsonic_server.index import index_letter, normalize
+from music_assistant.providers.subsonic_server.index import (
+    IndexedTrack,
+    index_letter,
+    normalize,
+    pick_existing_files,
+)
 from music_assistant.providers.subsonic_server.mapping import iso_time, make_id, parse_id
 from music_assistant.providers.subsonic_server.responses import (
     SubsonicError,
@@ -177,3 +183,50 @@ def test_lrc_lyrics_are_synced_and_sorted() -> None:
         [{"value": "Line one"}, {"value": "Line two"}],
     )
     assert parse_lyrics("  \n") is None
+
+
+def _indexed_track(track_id: int, path: pathlib.Path) -> IndexedTrack:
+    """
+    Return a minimal indexed track for a file path.
+
+    :param track_id: The library id.
+    :param path: The file path.
+    """
+    return IndexedTrack(
+        id=track_id,
+        name="Song",
+        sort_name="song",
+        version="",
+        duration=1,
+        favorite=False,
+        play_count=0,
+        last_played=0,
+        timestamp_added=0,
+        timestamp_modified=0,
+        folder_id=1,
+        provider_instance="fs",
+        rel_path=path.name,
+        abs_path=str(path),
+        suffix="m4a",
+        content_type="audio/mp4",
+        bit_rate=0,
+        sample_rate=0,
+        bit_depth=0,
+        channels=0,
+        size=0,
+        mtime=0.0,
+        uris=(),
+    )
+
+
+def test_first_existing_file_is_used(tmp_path: pathlib.Path) -> None:
+    """A track whose first file is gone uses its next file; a track with none is left out."""
+    kept = tmp_path / "01 Song.m4a"
+    kept.write_bytes(b"x" * 10)
+    gone = tmp_path / "01 Song [123].m4a"
+    picked = pick_existing_files(
+        {1: [_indexed_track(1, gone), _indexed_track(1, kept)], 2: [_indexed_track(2, gone)]}
+    )
+    assert list(picked) == [1]
+    assert picked[1].abs_path == str(kept)
+    assert picked[1].size == 10
