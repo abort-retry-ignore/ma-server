@@ -521,6 +521,10 @@ async def test_track_without_album_gets_an_unknown_album(server: Server) -> None
     assert art.status == 200
     assert art.headers["Content-Type"].startswith("image/")
     assert (await server.call("star", albumId=song["albumId"]))["status"] == "ok"
+    # the artist has no picture of its own: it gets its album's cover
+    artist_art = await server.get("getCoverArt", id=song["artistId"], size=32)
+    assert artist_art.status == 200
+    assert artist_art.headers["Content-Type"].startswith("image/")
 
 
 async def test_favourite_set_in_ma_shows_up_in_the_app(server: Server) -> None:

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
     from .server import SubsonicServer
 
+ARTIST_FILE_NAMES = ("artist.jpg", "artist.png", "folder.jpg")
 COVER_FILE_NAMES = ("cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "album.jpg")
 MAX_CACHED_IMAGES = 300
 
@@ -115,7 +116,7 @@ class Artwork:
                 sources.append((track.rel_path, track.provider_instance))
             return list(dict.fromkeys(sources))
         if prefix == PREFIX_ARTIST:
-            return await self._library_images(music.artists, item_id)
+            return await self._artist_sources(item_id)
         if prefix == PREFIX_PLAYLIST:
             return await self._library_images(music.playlists, item_id)
         return []
@@ -140,7 +141,34 @@ class Artwork:
                     sources.append((os.path.join(folder, name), track.provider_instance))
                     break
             sources.append((track.rel_path, track.provider_instance))
-        return sources
+            # last resort: the image MA has for the song itself (e.g. a YouTube thumbnail)
+            sources += await self._library_images(self.mass.music.tracks, track.id)
+        return list(dict.fromkeys(sources))
+
+    async def _artist_sources(self, artist_id: int) -> list[tuple[str, str]]:
+        """
+        Return the image candidates for an artist.
+
+        MA's image comes first, then an artist image in the artist's folder, then the cover
+        of one of the artist's albums.
+
+        :param artist_id: The library artist id.
+        """
+        sources = await self._library_images(self.mass.music.artists, artist_id)
+        index = self.server.index
+        artist = index.artists.get(artist_id)
+        albums = index.artist_albums(artist) if artist is not None else []
+        tracks = index.album_tracks(albums[0]) if albums else []
+        if tracks:
+            track = tracks[0]
+            artist_folder = os.path.dirname(os.path.dirname(track.rel_path))
+            abs_artist_folder = os.path.dirname(os.path.dirname(track.abs_path))
+            for name in ARTIST_FILE_NAMES:
+                if (Path(abs_artist_folder) / name).is_file():
+                    sources.append((os.path.join(artist_folder, name), track.provider_instance))
+                    break
+            sources += await self._album_sources(albums[0].id)
+        return list(dict.fromkeys(sources))
 
     @staticmethod
     async def _library_images(controller: Any, item_id: int) -> list[tuple[str, str]]:
