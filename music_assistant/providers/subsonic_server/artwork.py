@@ -13,6 +13,7 @@ from aiohttp import web
 from music_assistant_models.enums import ImageType
 from music_assistant_models.errors import MusicAssistantError
 
+from .index import normalize
 from .mapping import PREFIX_ALBUM, PREFIX_ARTIST, PREFIX_PLAYLIST, PREFIX_TRACK, parse_id
 from .responses import SubsonicError
 
@@ -163,10 +164,12 @@ class Artwork:
             track = tracks[0]
             artist_folder = os.path.dirname(os.path.dirname(track.rel_path))
             abs_artist_folder = os.path.dirname(os.path.dirname(track.abs_path))
-            for name in ARTIST_FILE_NAMES:
-                if (Path(abs_artist_folder) / name).is_file():
-                    sources.append((os.path.join(artist_folder, name), track.provider_instance))
-                    break
+            # only a folder named after the artist: a compilation sits under "Various Artists"
+            if artist is not None and normalize(artist.name) in normalize(Path(artist_folder).name):
+                for name in ARTIST_FILE_NAMES:
+                    if (Path(abs_artist_folder) / name).is_file():
+                        sources.append((os.path.join(artist_folder, name), track.provider_instance))
+                        break
             sources += await self._album_sources(albums[0].id)
         return list(dict.fromkeys(sources))
 
