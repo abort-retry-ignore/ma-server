@@ -1,22 +1,13 @@
 # CLAUDE.md
 
-Music Assistant is an async Python music library manager that connects to streaming services and speakers, integrating with Home Assistant.
-
-## Behaviour
-
-- NEVER automatically reply on Github (PR's or Discussions) without explicit consent from the developer.
+Music Assistant is an async music library manager that connects to streaming services and speakers, integrating with Home Assistant.
 
 ## Usage policy
 
-This private fork of Music Assistant streams music to the user's own speakers and caches local data to reduce bandwidth and environmental waste.
+This private fork of Music Assistant streams music to the user's own speakers and devices and caches local data to reduce bandwidth and environmental waste.  It does not:
 
-- expose a music service's own audio URL to anything outside the server (an API result, a
-  media item, or a route that hands it to a caller)
 - call a service's API without throttling, or re-fetch what the cache already holds)
 - add storing of audio for commercial purposes
-
-Some guards in the codebase exist only for this reason and read as removable if you do not know
-that — the readrate pacing on the stream endpoints
 
 ## Development Commands
 
@@ -46,10 +37,9 @@ Only use comments to explain complex, multi-line blocks of code. Do not comment 
 
 ### Docstring Format
 
-Use Sphinx-style docstrings with `:param:` syntax. For simple functions, a single-line docstring is fine.
-Don't explain inner workings of the code in the docstrings (you can use inline comments for that if/when needed). The docstring should provide clarity to the caller of the function/method, not explain how it works technically/internally. Use our preference for multi line docstrings where the first line starts on the next line:
+Use Sphinx-style docstrings with `:param:` syntax. For simple functions, a single-line docstring is fine. Don't explain inner workings of the code in the docstrings (you can use inline comments for that if/when needed). The docstring should provide clarity to the caller of the function/method, not explain how it works technically/internally. Use our preference for multi line docstrings where the first line starts on the next line:
 
-```python
+```
 def my_function(param1: str, param2: int, param3: bool = False) -> str:
     """
     Brief one-line description of the function.
@@ -63,6 +53,7 @@ def my_function(param1: str, param2: int, param3: bool = False) -> str:
 Do **not** use Google-style (`Args:`) or bullet-style (`- param:`) docstrings.
 
 ### File structure
+
 Private methods should be at the bottom of the file, public at the top.
 
 ## Branching and PRs
@@ -91,8 +82,8 @@ The ProviderMapping has this structure:
 
 **Important patterns:**
 
-- A media item itself also has an item_id and provider attribute. For an item that comes straight from the musicprovider itself (so not from the MA library) the provider attribute will be set to the instance_id of that provider.
+- A media item itself also has an item\_id and provider attribute. For an item that comes straight from the musicprovider itself (so not from the MA library) the provider attribute will be set to the instance\_id of that provider.
 - Library items are identified by `item.provider == "library"` where `item.item_id` is the library DB ID
-- `provider_domain='library'` **never exists** in provider_mappings — library items don't have mappings to themselves
+- `provider_domain='library'` **never exists** in provider\_mappings — library items don't have mappings to themselves
 - To resolve a provider item to its library equivalent, use: `await mass.music.<mediatype>.get_library_item_by_prov_id(item_id, provider_instance_id_or_domain)`
 - Never assume you can use `mapping.item_id` directly as a library DB ID — always use the resolution method above
