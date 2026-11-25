@@ -1,5 +1,5 @@
 """
-Play memory: a lasting record of the tracks that were listened to in full.
+Play memory: a lasting record of the tracks that were listened to for a while.
 
 Voice requests often reach the search misheard ("anvil of chrome" for "Anvil of Crom"), and
 streaming services carry look-alike tracks named exactly like those mishearings. A search
@@ -46,7 +46,12 @@ DB_FILE = "play_memory.db"
 TABLE_HEARD = "heard_tracks"
 TABLE_BLOCKED = "blocked_tracks"
 TABLE_META = "meta"
-META_SEEDED = "seeded_from_playlog"
+# bumped when the rule for remembering a track changes, so the playlog is read once more
+META_SEEDED = "seeded_from_playlog_min_60s"
+
+# a track counts as heard once it played this long (or to the end, when it is shorter):
+# a look-alike is usually noticed and skipped well before that
+MIN_SECONDS_HEARD = 60
 
 # a heard track must be at least this similar to the query to be put on top
 MATCH_THRESHOLD = 0.85
@@ -54,7 +59,7 @@ MATCH_THRESHOLD = 0.85
 # so shorter strings only count when they match exactly
 MIN_FUZZY_LENGTH = 8
 MAX_PROMOTED_TRACKS = 3
-# a track reported as fully played again within this window is the same listen
+# a track reported again within this window is the same listen (e.g. paused, then finished)
 REPLAY_WINDOW_SECONDS = 600
 # words that searches add around a title and that say nothing about which song is meant
 NOISE_WORDS = frozenset({"by", "official", "audio", "remaster", "remastered", "song", "version"})
@@ -64,7 +69,7 @@ BRACKETED = re.compile(r"\s*[(\[{][^)\]}]*[)\]}]")
 
 @dataclass
 class HeardTrack:
-    """A track that was listened to in full."""
+    """A track that was listened to for at least a minute, or to the end."""
 
     uri: str
     name: str
@@ -76,7 +81,7 @@ class HeardTrack:
 
 
 class PlayMemory:
-    """Remembers fully played tracks and uses them to correct near-miss track searches."""
+    """Remembers tracks that were listened to and uses them to correct near-miss searches."""
 
     def __init__(self, mass: MusicAssistant) -> None:
         """
@@ -131,12 +136,16 @@ class PlayMemory:
             await self._db.close()
             self._db = None
 
-    async def remember(self, track: Track) -> None:
+    async def remember(self, track: Track, *, seconds_played: int, fully_played: bool) -> None:
         """
-        Record that a track was listened to in full.
+        Record a play of a track; it is kept once it played long enough.
 
-        :param track: The track that was fully played.
+        :param track: The track that was played.
+        :param seconds_played: How long the track played.
+        :param fully_played: Whether the track played to the end.
         """
+        if not fully_played and seconds_played < MIN_SECONDS_HEARD:
+            return
         if self._db is None or self.is_blocked(track):
             return
         track = await self._prefer_library_item(track)
@@ -407,11 +416,12 @@ class PlayMemory:
         return library_track or track
 
     async def _seed_from_playlog(self) -> None:
-        """Fill a new play memory with the fully played tracks still in the playlog."""
+        """Add the tracks in the playlog that played long enough to count as heard."""
         assert self._db is not None
         rows = await self.mass.music.database.get_rows_from_query(
             f"SELECT item_id, provider, name, artists, MAX(timestamp) AS last_played "
-            f"FROM {DB_TABLE_PLAYLOG} WHERE media_type = 'track' AND fully_played = 1 "
+            f"FROM {DB_TABLE_PLAYLOG} WHERE media_type = 'track' "
+            f"AND (fully_played = 1 OR seconds_played >= {MIN_SECONDS_HEARD}) "
             "GROUP BY item_id, provider",
             limit=0,
         )
@@ -452,7 +462,7 @@ class PlayMemory:
         await self._db.insert_or_replace(
             TABLE_META, {"key": META_SEEDED, "value": str(int(utc_timestamp()))}
         )
-        self.logger.info("Play memory seeded with %s fully played tracks from the playlog", added)
+        self.logger.info("Play memory: added %s heard tracks from the playlog", added)
 
 
 def _rank_matches(query: str, candidates: Iterable[HeardTrack]) -> list[HeardTrack]:

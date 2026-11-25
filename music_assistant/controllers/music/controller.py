@@ -1694,11 +1694,14 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                         )
                     )
 
+        if isinstance(media_item, Track) and not is_playing:
+            await self.play_memory.remember(
+                media_item, seconds_played=seconds_played, fully_played=fully_played
+            )
+
         # also update playcount in library table (if fully played)
         if not fully_played or is_playing:
             return
-        if isinstance(media_item, Track):
-            await self.play_memory.remember(media_item)
         try:
             ctrl = self.get_controller(media_item.media_type)
         except NotImplementedError:

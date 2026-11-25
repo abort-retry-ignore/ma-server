@@ -175,7 +175,7 @@ async def test_heard_track_is_put_on_top_of_search_results(tmp_path: pathlib.Pat
     memory = await _setup_memory(mass)
     real = _track("111", "apple_music--abc", "Anvil of Crom", "Basil Poledouris")
     lookalike = _track("222", "apple_music--abc", "Anvil of Chrome", "Chrome Nine")
-    await memory.remember(real)
+    await memory.remember(real, seconds_played=200, fully_played=True)
 
     results = SearchResults(tracks=[lookalike])
     adjusted = await memory.adjust_search_results("Anvil of Chrome", [MediaType.TRACK], 5, results)
@@ -191,7 +191,7 @@ async def test_heard_track_already_in_results_moves_to_top(tmp_path: pathlib.Pat
     memory = await _setup_memory(mass)
     real = _track("111", "apple_music--abc", "Anvil of Crom", "Basil Poledouris")
     lookalike = _track("222", "apple_music--abc", "Anvil of Chrome", "Chrome Nine")
-    await memory.remember(real)
+    await memory.remember(real, seconds_played=200, fully_played=True)
 
     adjusted = await memory.adjust_search_results(
         "Anvil of Chrome", [MediaType.TRACK], 5, SearchResults(tracks=[lookalike, real])
@@ -205,7 +205,9 @@ async def test_search_without_tracks_is_left_alone(tmp_path: pathlib.Path) -> No
     """Searches that do not ask for tracks are returned unchanged."""
     mass = _make_mass(tmp_path)
     memory = await _setup_memory(mass)
-    await memory.remember(_track("111", "apple_music--abc", "Anvil of Crom"))
+    await memory.remember(
+        _track("111", "apple_music--abc", "Anvil of Crom"), seconds_played=200, fully_played=True
+    )
     results = SearchResults()
     assert (
         await memory.adjust_search_results("anvil of chrome", [MediaType.ALBUM], 5, results)
@@ -222,7 +224,7 @@ async def test_blocked_track_is_left_out_and_forgotten(tmp_path: pathlib.Path) -
     library_lookalike = _track("9", "library", "Anvil of Chrome", "Chrome Nine")
     library_lookalike.provider_mappings = set(lookalike.provider_mappings)
     mass.music.tracks.get_library_item_by_prov_id = AsyncMock(return_value=library_lookalike)
-    await memory.remember(lookalike)
+    await memory.remember(lookalike, seconds_played=200, fully_played=True)
 
     blocked = await memory.block_track(lookalike)
 
@@ -260,19 +262,37 @@ async def test_blocked_track_is_not_remembered(tmp_path: pathlib.Path) -> None:
     memory = await _setup_memory(mass)
     lookalike = _track("222", "apple_music--abc", "Anvil of Chrome")
     await memory.block_track(lookalike)
-    await memory.remember(lookalike)
+    await memory.remember(lookalike, seconds_played=200, fully_played=True)
     assert (await memory.list_entries())["heard"] == []
     await memory.close()
 
 
 async def test_replay_within_window_counts_once(tmp_path: pathlib.Path) -> None:
-    """Two fully played reports of one listen count as a single play."""
+    """Two reports of one listen count as a single play."""
     mass = _make_mass(tmp_path)
     memory = await _setup_memory(mass)
     track = _track("111", "apple_music--abc", "Anvil of Crom")
-    await memory.remember(track)
-    await memory.remember(track)
+    await memory.remember(track, seconds_played=200, fully_played=True)
+    await memory.remember(track, seconds_played=200, fully_played=True)
     assert (await memory.list_entries())["heard"][0]["plays"] == 1
+    await memory.close()
+
+
+async def test_a_minute_of_listening_counts(tmp_path: pathlib.Path) -> None:
+    """A track counts once it played a minute, or to the end when it is shorter."""
+    mass = _make_mass(tmp_path)
+    memory = await _setup_memory(mass)
+    await memory.remember(
+        _track("1", "apple_music--abc", "Skipped Early"), seconds_played=59, fully_played=False
+    )
+    await memory.remember(
+        _track("2", "apple_music--abc", "Heard A Minute"), seconds_played=61, fully_played=False
+    )
+    await memory.remember(
+        _track("3", "apple_music--abc", "Short Intro"), seconds_played=40, fully_played=True
+    )
+    names = {e["name"] for e in (await memory.list_entries())["heard"]}
+    assert names == {"Heard A Minute", "Short Intro"}
     await memory.close()
 
 
@@ -280,7 +300,11 @@ async def test_memory_survives_a_restart(tmp_path: pathlib.Path) -> None:
     """Heard and blocked tracks are read back from the database file."""
     mass = _make_mass(tmp_path)
     memory = await _setup_memory(mass)
-    await memory.remember(_track("111", "apple_music--abc", "Anvil of Crom", "Basil Poledouris"))
+    await memory.remember(
+        _track("111", "apple_music--abc", "Anvil of Crom", "Basil Poledouris"),
+        seconds_played=200,
+        fully_played=True,
+    )
     await memory.block_track(_track("222", "apple_music--abc", "Anvil of Chrome"))
     await memory.close()
 
@@ -296,7 +320,7 @@ async def test_memory_survives_a_restart(tmp_path: pathlib.Path) -> None:
 
 
 async def test_new_memory_is_seeded_from_the_playlog(tmp_path: pathlib.Path) -> None:
-    """Fully played tracks already in the playlog are remembered, keyed by their library uri."""
+    """Tracks the playlog shows as heard are remembered, keyed by their library uri."""
     mass = _make_mass(tmp_path)
     mass.music.database.get_rows_from_query = AsyncMock(
         return_value=[
@@ -370,7 +394,7 @@ async def test_block_current_needs_one_playing_queue(tmp_path: pathlib.Path) -> 
 
 
 async def test_full_server_corrects_a_misheard_search(mass: MusicAssistant) -> None:
-    """On a running server, a fully played track wins a misheard search until it is blocked."""
+    """On a running server, a heard track wins a misheard search until it is blocked."""
     assert "music/play_memory/block_current" in mass.command_handlers
     library_track = await mass.music.tracks.add_item_to_library(
         _track("anvil.mp3", "filesystem_local--AbCd", "Anvil of Crom", "Basil Poledouris")
@@ -386,6 +410,26 @@ async def test_full_server_corrects_a_misheard_search(mass: MusicAssistant) -> N
     await mass.music.play_memory.block_track(library_track)
     blocked = await mass.music.search("Anvil of Crom", [MediaType.TRACK])
     assert blocked.tracks == []
+
+
+async def test_full_server_remembers_a_stopped_track(mass: MusicAssistant) -> None:
+    """A track stopped after more than a minute is remembered; a shorter listen is not."""
+    heard = await mass.music.tracks.add_item_to_library(
+        _track("crom.mp3", "filesystem_local--AbCd", "Anvil of Crom", "Basil Poledouris")
+    )
+    skipped = await mass.music.tracks.add_item_to_library(
+        _track("chrome.mp3", "filesystem_local--AbCd", "Anvil of Chrome", "Chrome Nine")
+    )
+
+    await mass.music.mark_item_played(heard, fully_played=False, seconds_played=75)
+    await mass.music.mark_item_played(skipped, fully_played=False, seconds_played=11)
+    # a progress report while the track still plays is not a finished listen
+    await mass.music.mark_item_played(
+        skipped, fully_played=False, seconds_played=90, is_playing=True
+    )
+
+    entries = (await mass.music.play_memory.list_entries())["heard"]
+    assert [e["uri"] for e in entries] == [heard.uri]
 
 
 async def test_unloadable_heard_track_does_not_break_search(tmp_path: pathlib.Path) -> None:
