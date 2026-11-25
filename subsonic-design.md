@@ -14,6 +14,11 @@ What was built differs from the plan below in a few places:
 - **Where the reply shapes come from:** Navidrome 0.64 replies captured on the home server. A
   field-by-field comparison against MA's replies leaves no fields missing apart from data the test
   library doesn't have.
+- **Apple Music (added later the same day, replacing section 16's live-stream idea):**
+  - Search also lists Apple Music songs, albums and artists, after the music folder's own results. IDs are `amt-`, `ama-` and `amr-`.
+  - Playing an Apple song that has no file waits while the fork's Apple Music cache saves it (a few seconds), then sends the saved file.
+  - Requests for the same song share one save, and each user saves one song at a time.
+  - The setting "Include Apple Music in search" turns it off.
 - **Tests:** `tests/providers/subsonic_server/` has 22 tests. The full-server ones generate FLAC
   files with ffmpeg, scan them with the filesystem provider and call the API over HTTP.
 
