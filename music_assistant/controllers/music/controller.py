@@ -100,6 +100,7 @@ from music_assistant.controllers.music.media.playlists import PlaylistController
 from music_assistant.controllers.music.media.podcasts import PodcastsController
 from music_assistant.controllers.music.media.radio import RadioController
 from music_assistant.controllers.music.media.tracks import TracksController
+from music_assistant.controllers.music.play_memory import PlayMemory
 from music_assistant.controllers.music.recency import RecencyEngine
 from music_assistant.controllers.music.recommendations.controller import (
     RecommendationsController,
@@ -293,6 +294,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         self.genres = GenreController(self.mass)
         self.recommendations = RecommendationsController(self.mass)
         self.recency = RecencyEngine(self.mass)
+        self.play_memory = PlayMemory(self.mass)
         self._database: DatabaseConnection | None = None
         self._sync_lock = asyncio.Lock()
         self.manifest.name = "Music controller"
@@ -360,6 +362,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         self.config = config
         # setup library database
         await self._setup_database()
+        await self.play_memory.setup()
         # make sure to finish any removal jobs
         for removed_provider in cast(
             "list[str]",
@@ -377,6 +380,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
 
     async def close(self) -> None:
         """Cleanup on exit."""
+        await self.play_memory.close()
         if self._database:
             await self._database.close()
 
@@ -537,6 +541,10 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             category=CACHE_CATEGORY_SEARCH_RESULTS,
             base_class=SearchResults,
         ):
+            if providers is None:
+                return await self.play_memory.adjust_search_results(
+                    search_query, media_types, limit, cast("SearchResults", cache)
+                )
             return cast("SearchResults", cache)
         # Check if the search query is a streaming provider public shareable URL
         if (url_result := await self._search_shareable_url(search_query)) is not None:
@@ -688,6 +696,10 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         if all_results_complete:
             await self._cache_search_results(
                 cache_key, result, SEARCH_CACHE_EXPIRATION_COMBINED, self.domain
+            )
+        if providers is None:
+            return await self.play_memory.adjust_search_results(
+                search_query, media_types, limit, result
             )
         return result
 
@@ -1685,6 +1697,8 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         # also update playcount in library table (if fully played)
         if not fully_played or is_playing:
             return
+        if isinstance(media_item, Track):
+            await self.play_memory.remember(media_item)
         try:
             ctrl = self.get_controller(media_item.media_type)
         except NotImplementedError:
@@ -3402,6 +3416,8 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         for func in library_functions:
             result = await func(search=searchname)
             for item in result:
+                if isinstance(item, Track) and self.play_memory.is_blocked(item):
+                    continue
                 # handle optional artist filter
                 if (
                     artist

@@ -23,6 +23,7 @@ from music_assistant.controllers.music.constants import (
     SEARCH_CACHE_EXPIRATION_LOCAL_PROVIDER,
     SEARCH_CACHE_EXPIRATION_STREAMING_PROVIDER,
 )
+from music_assistant.controllers.music.play_memory import PlayMemory
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
@@ -117,6 +118,7 @@ def _make_controller(providers: list[Mock]) -> MusicController:
         return_value=[p.instance_id for p in providers]
     )
     controller.search_library = AsyncMock(return_value=SearchResults())  # type: ignore[method-assign]
+    controller.play_memory = PlayMemory(mass)
     return controller
 
 

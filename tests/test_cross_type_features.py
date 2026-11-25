@@ -19,6 +19,7 @@ from music_assistant_models.media_items import (
 from music_assistant.controllers.music import MusicController
 from music_assistant.controllers.music.media.artists import ArtistsController
 from music_assistant.controllers.music.media.tracks import TracksController
+from music_assistant.controllers.music.play_memory import PlayMemory
 from music_assistant.mass import MusicAssistant
 from music_assistant.models.metadata_provider import MetadataProvider
 from music_assistant.models.music_provider import MusicProvider
@@ -716,6 +717,7 @@ async def test_global_search_includes_plugin_providers_with_search() -> None:
     controller.get_unique_providers = Mock(return_value=["m_a"])  # type: ignore[method-assign]
     controller.search_library = AsyncMock(return_value=SearchResults())  # type: ignore[method-assign]
     controller._search_provider = AsyncMock(return_value=SearchResults())  # type: ignore[method-assign]
+    controller.play_memory = PlayMemory(mass)
 
     with patch(
         "music_assistant.controllers.music.controller.sort_search_result",
