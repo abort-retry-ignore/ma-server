@@ -23,6 +23,7 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from .audio_cache import ENV_AUDIO_CACHE_PATH, AudioCache, AudioDownload
 from .cache_library import ENV_AUDIO_LIBRARY_PATH
+from .favourites_sync import FavouriteSongsSync, RatingsRecorder
 from .provider import AppleMusicProvider
 from .streaming import AppleMusicStreamingManager
 
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.media_items import Track
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant import MusicAssistant
@@ -163,6 +165,9 @@ class CachingAppleMusicProvider(AppleMusicProvider):
         super().__init__(mass, manifest, config)
         self.caching_streams = CachingStreamingManager(self)
         self.streaming_manager = self.caching_streams
+        self.favourite_songs = FavouriteSongsSync(
+            mass, self.instance_id, self.set_favorite, self.logger
+        )
 
     async def loaded_in_mass(self) -> None:
         """Publish existing cache entries after the provider has loaded."""
@@ -172,6 +177,26 @@ class CachingAppleMusicProvider(AppleMusicProvider):
                 self._publish_cached_audio,
                 task_id=f"{self.instance_id}.publish_cached_audio",
             )
+
+    async def get_library_tracks(self) -> AsyncGenerator[Track]:
+        """
+        Return the library songs, then bring favourite songs in line with Apple Music.
+
+        The favourites are only reconciled after the whole listing went through.
+        """
+        recorder = RatingsRecorder(self.api_client)
+        recorder.attach()
+        favourites: dict[str, bool] = {}
+        try:
+            async for track in super().get_library_tracks():
+                favourites[track.item_id] = bool(track.favorite)
+                yield track
+        finally:
+            recorder.detach()
+        self.mass.create_task(
+            self.favourite_songs.reconcile(favourites, recorder.known),
+            task_id=f"{self.instance_id}.reconcile_favourite_songs",
+        )
 
     async def get_audio_stream(
         self, streamdetails: StreamDetails, seek_position: int = 0
