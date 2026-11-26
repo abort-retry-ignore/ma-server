@@ -29,6 +29,7 @@ from .constants import (
     CONF_APPLE_SEARCH,
     CONF_LOG_REQUESTS,
     CONF_SERVER_TYPE,
+    CONF_YOUTUBE_SEARCH,
     ERR_GENERIC,
     INDEX_REBUILD_DELAY,
     NAVIDROME_VERSION,
@@ -108,6 +109,11 @@ class SubsonicServer:
     def apple_search_enabled(self) -> bool:
         """Return whether Apple Music search results are offered to clients."""
         return bool(self.provider.config.get_value(CONF_APPLE_SEARCH, True))
+
+    @property
+    def youtube_search_enabled(self) -> bool:
+        """Return whether YouTube Music search results are offered to clients."""
+        return bool(self.provider.config.get_value(CONF_YOUTUBE_SEARCH, True))
 
     def schedule_index_rebuild(self) -> None:
         """Rebuild the library index shortly, after a burst of library changes has settled."""

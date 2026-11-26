@@ -26,6 +26,7 @@ from .constants import (
     PLAYLIST_COUNT_MAX_AGE,
     PLAYLIST_COUNT_PAUSE,
     PLAYLIST_COUNT_START_DELAY,
+    YOUTUBE_DOMAIN,
 )
 from .mapping import PREFIX_PLAYLIST, parse_id
 from .responses import SubsonicError
@@ -96,22 +97,27 @@ class PlaylistBook:
             self._task = None
 
     async def rows(self) -> list[Mapping[str, Any]]:
-        """Return the playlists to show: MA's own, and Apple Music ones still in the library."""
+        """Return the playlists to show: MA's own, and Apple/YouTube Music ones in the library."""
         rows = await self.mass.music.database.get_rows_from_query(
             "SELECT p.item_id, p.name, p.is_editable, p.timestamp_added, p.timestamp_modified, "
             "pm.provider_domain FROM playlists p JOIN provider_mappings pm "
             "ON pm.item_id = p.item_id AND pm.media_type = 'playlist' "
             "WHERE pm.provider_domain = :builtin "
-            "OR (pm.provider_domain = :apple AND pm.in_library = 1) "
+            "OR (pm.provider_domain IN (:apple, :youtube) AND pm.in_library = 1) "
             "ORDER BY p.sort_name",
-            {"builtin": BUILTIN, "apple": APPLE_DOMAIN},
+            {"builtin": BUILTIN, "apple": APPLE_DOMAIN, "youtube": YOUTUBE_DOMAIN},
             limit=0,
         )
-        apple = self.server.catalog.enabled
+        catalog = self.server.catalog
+        shown = {
+            BUILTIN: True,
+            APPLE_DOMAIN: catalog.apple_enabled,
+            YOUTUBE_DOMAIN: catalog.youtube_enabled,
+        }
         result: dict[int, Mapping[str, Any]] = {}
         for row in rows:
             playlist_id = int(row["item_id"])
-            if playlist_id in result or (row["provider_domain"] != BUILTIN and not apple):
+            if playlist_id in result or not shown.get(row["provider_domain"]):
                 continue
             result[playlist_id] = row
         return list(result.values())
@@ -205,7 +211,7 @@ class PlaylistBook:
         """
         Return the Subsonic ID a playlist song is shown with.
 
-        :param song: A song with a file, or an Apple Music track.
+        :param song: A song with a file, or an Apple or YouTube Music track.
         """
         if isinstance(song, Track):
             return f"amt-{self.server.catalog.apple_track_id(song)}"

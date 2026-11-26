@@ -2491,6 +2491,8 @@
   "provider.subsonic_server.config_entries.server_type.options.navidrome": "Navidrome",
   "provider.subsonic_server.config_entries.subsonic_password.description": "Leave empty to give this user no Subsonic access. Use a new password made just for Subsonic: apps send it with every request and some store it unencrypted.",
   "provider.subsonic_server.config_entries.subsonic_password.label": "Subsonic password for {0} (login: {1})",
+  "provider.subsonic_server.config_entries.youtube_search.description": "Search results also list YouTube Music songs, albums and artists that Apple Music didn't find, and YouTube Music playlists are shown. Playing a song that isn't saved yet saves it first (a few seconds, one song at a time).",
+  "provider.subsonic_server.config_entries.youtube_search.label": "Include YouTube Music in search",
   "provider.subsonic_server.manifest.description": "Lets Subsonic apps (Arpeggi, Symfonium, play:Sub, ...) browse and play the music files in your library, like a Navidrome server.",
   "provider.sverigesradio.manifest.description": "Listen to Sweden’s public service radio — live national and local channels.",
   "provider.sync_group.config_entries.allowed_members.description": "Limit which players can join this group. Leave empty to allow any sync-compatible player. This can be used to reduce the list of players that show up for joining in case you have a lot of players.",

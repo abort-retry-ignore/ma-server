@@ -15,7 +15,7 @@ from music_assistant_models.errors import MusicAssistantError
 
 from .api_library import track_from_id
 from .apple import PREFIX_APPLE_TRACK, apple_id, is_icloud_id
-from .constants import ERR_GENERIC, ERR_NOT_FOUND
+from .constants import CONTENT_TYPES, ERR_GENERIC, ERR_NOT_FOUND
 from .context import RequestContext, api_method
 from .index import normalize
 from .mapping import PREFIX_TRACK, make_id
@@ -130,10 +130,10 @@ async def get_lyrics(ctx: RequestContext) -> dict[str, Any]:
 
 async def _apple_file(ctx: RequestContext, item_id: str) -> web.StreamResponse:
     """
-    Send an Apple Music song, saving it first when it has no file yet.
+    Send an Apple or YouTube Music song, saving it first when it has no file yet.
 
     :param ctx: The request context.
-    :param item_id: The Apple Music track id.
+    :param item_id: The catalogue track id.
     """
     catalog = ctx.server.catalog
     if is_icloud_id(item_id):
@@ -142,15 +142,16 @@ async def _apple_file(ctx: RequestContext, item_id: str) -> web.StreamResponse:
     path = await catalog.ensure_file(item_id, ctx.user_id)
     waited = time.monotonic() - started
     if waited > 0.5:
-        ctx.note = f" (Apple Music song saved first, waited {waited:.1f} s)"
+        ctx.note = f" ({catalog.service_name(item_id)} song saved first, waited {waited:.1f} s)"
     track = await catalog.track(item_id)
+    suffix = Path(path).suffix.lstrip(".").lower()
     headers = {
-        "Content-Type": "audio/mp4",
+        "Content-Type": CONTENT_TYPES.get(suffix, "application/octet-stream"),
         "X-Content-Duration": f"{float(track.duration):.2f}",
         "Accept-Ranges": "bytes",
     }
     if ctx.method == "download":
-        name = urllib.parse.quote(f"{track.name}.m4a")
+        name = urllib.parse.quote(f"{track.name}.{suffix}")
         headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{name}"
     return web.FileResponse(path, headers=headers)
 

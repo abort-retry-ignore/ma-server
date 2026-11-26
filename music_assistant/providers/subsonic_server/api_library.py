@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import time
 from typing import TYPE_CHECKING, Any
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Track
 
-from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK, apple_id
+from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK, apple_id, song_key
 from .constants import (
     DEFAULT_LIST_SIZE,
     DEFAULT_SEARCH_COUNT,
@@ -31,7 +32,7 @@ from .mapping import (
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 # the most favourite songs without a file listed as Apple Music songs
 MAX_FAVOURITES = 2000
@@ -345,7 +346,8 @@ async def search(ctx: RequestContext) -> dict[str, Any]:
     """
     Search artists, albums and songs; an empty query lists everything, page by page.
 
-    The music folder comes first; Apple Music results follow when they are enabled.
+    The music folder comes first; Apple Music results follow, then YouTube Music results that
+    neither of those has, when they are enabled.
     """
     query = ctx.get("query", "") or ""
     folder_id = ctx.folder_id()
@@ -362,25 +364,17 @@ async def search(ctx: RequestContext) -> dict[str, Any]:
     tracks: list[Any] = list(index.search_tracks(query, folder_id))
     if song_offset == 0 and query.strip('" '):
         tracks = await _with_heard_tracks_first(ctx, query, tracks)
-    if catalog.enabled and (apple := await catalog.search(query)) is not None:
-        local_artists = {normalize(a.name) for a in artists}
-        artists += [a for a in apple.artists if normalize(a.name) not in local_artists]
-        local_albums = {normalize(a.name) for a in albums}
-        albums += [a for a in apple.albums if normalize(a.name) not in local_albums]
-        seen: set[str] = set()
-        for track in apple.tracks:
-            if not isinstance(track, Track):
+    if catalog.enabled:
+        apple, youtube = await asyncio.gather(catalog.search(query), catalog.search_youtube(query))
+        songs_seen = {_song_key(ctx, t) for t in tracks}
+        for found, only_new_songs in ((apple, False), (youtube, True)):
+            if found is None:
                 continue
-            item_id = catalog.apple_track_id(track)
-            if (
-                item_id is None
-                or item_id in seen
-                or catalog.is_blocked(item_id)
-                or catalog.library_track(item_id) is not None
-            ):
-                continue
-            seen.add(item_id)
-            tracks.append(track)
+            known_artists = {normalize(a.name) for a in artists}
+            artists += [a for a in found.artists if normalize(a.name) not in known_artists]
+            known_albums = {normalize(a.name) for a in albums}
+            albums += [a for a in found.albums if normalize(a.name) not in known_albums]
+            tracks += _new_tracks(ctx, found.tracks, songs_seen, only_new_songs)
     artists = artists[artist_offset : artist_offset + artist_count]
     albums = albums[album_offset : album_offset + album_count]
     tracks = tracks[song_offset : song_offset + song_count]
@@ -407,6 +401,50 @@ async def search(ctx: RequestContext) -> dict[str, Any]:
     if songs := [s for s in songs if s is not None]:
         result["song"] = songs
     return {"searchResult3" if id3 else "searchResult2": result}
+
+
+def _new_tracks(
+    ctx: RequestContext, found: Sequence[Any], songs_seen: set[str], only_new_songs: bool
+) -> list[Track]:
+    """
+    Return the streaming service tracks of a search that can be listed.
+
+    :param ctx: The request context.
+    :param found: The tracks the service found.
+    :param songs_seen: Keys of the songs listed so far (updated).
+    :param only_new_songs: Leave out songs with the same title and artist as one listed already.
+    """
+    catalog = ctx.server.catalog
+    result: list[Track] = []
+    for track in found:
+        if not isinstance(track, Track):
+            continue
+        item_id = catalog.apple_track_id(track)
+        key = _song_key(ctx, track)
+        if (
+            item_id is None
+            or (only_new_songs and key in songs_seen)
+            or catalog.is_blocked(item_id)
+            or catalog.library_track(item_id) is not None
+        ):
+            continue
+        songs_seen.add(key)
+        result.append(track)
+    return result
+
+
+def _song_key(ctx: RequestContext, track: IndexedTrack | Track) -> str:
+    """
+    Return the key that tells whether two services list the same song.
+
+    :param ctx: The request context.
+    :param track: A song with a file, or a streaming service track.
+    """
+    if isinstance(track, IndexedTrack):
+        artists = ctx.server.index.artists
+        first = artists.get(track.artist_ids[0]) if track.artist_ids else None
+        return song_key(track.name, first.name if first else "")
+    return song_key(track.name, track.artists[0].name if track.artists else "")
 
 
 async def song_entry(ctx: RequestContext, value: str) -> dict[str, Any]:

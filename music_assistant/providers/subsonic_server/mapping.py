@@ -13,9 +13,10 @@ from .apple import (
     PREFIX_APPLE_ARTIST,
     PREFIX_APPLE_TRACK,
     is_name_ref,
+    is_youtube_id,
     name_ref,
 )
-from .constants import APPLE_BIT_RATE, APPLE_DOMAIN, ERR_NOT_FOUND
+from .constants import APPLE_BIT_RATE, CONTENT_TYPES, ERR_NOT_FOUND, YOUTUBE_BIT_RATE
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
@@ -319,9 +320,9 @@ class Mapper:
 
     def apple_song(self, track: Track) -> dict[str, Any] | None:
         """
-        Return the song entry of an Apple Music track (the library song when it has a file).
+        Return the song entry of an Apple or YouTube Music track, or its file's library song.
 
-        Returns None for a track without an Apple Music id.
+        Returns None for a track that is on neither service (or whose service is switched off).
 
         :param track: The track, from search, an Apple album or the library.
         """
@@ -349,6 +350,9 @@ class Mapper:
             legacy = make_id(PREFIX_APPLE_ALBUM, name_ref(album_ref[0], album_ref[1]))
             self.catalog.remember_images(legacy, track)
         genres = sorted(track.metadata.genres or []) if track.metadata else []
+        youtube = is_youtube_id(item_id)
+        bit_rate = YOUTUBE_BIT_RATE if youtube else APPLE_BIT_RATE
+        suffix = "opus" if youtube else "m4a"
         title = display_name(track.name, track.version)
         album_name = album_ref[1] if album_ref else ""
         artist_name = "; ".join(a[1] for a in artists)
@@ -363,12 +367,12 @@ class Mapper:
             "year": album.year if album else None,
             "genre": genres[0] if genres else None,
             "coverArt": cover_id,
-            "size": int(track.duration * APPLE_BIT_RATE * 1000 / 8),
-            "contentType": "audio/mp4",
-            "suffix": "m4a",
+            "size": int(track.duration * bit_rate * 1000 / 8),
+            "contentType": CONTENT_TYPES[suffix],
+            "suffix": suffix,
             "duration": track.duration,
-            "bitRate": APPLE_BIT_RATE,
-            "path": f"Apple Music/{artist_name}/{album_name}/{title}.m4a",
+            "bitRate": bit_rate,
+            "path": f"{self.catalog.service_name(item_id)}/{artist_name}/{album_name}/{title}.{suffix}",
             "discNumber": (track.disc_number or 1) if album_id else None,
             "albumId": album_id,
             "artistId": make_id(PREFIX_APPLE_ARTIST, artists[0][0]) if artists else None,
@@ -516,9 +520,10 @@ class Mapper:
         """
         assert self.catalog is not None
         if isinstance(item, ItemMapping):
-            if item.provider == "library" or not item.provider.startswith(APPLE_DOMAIN):
+            if item.provider == "library":
                 return None
-            return name_ref(item.item_id, item.name, artist), item.name
+            item_id = self.catalog.ref_id(item.provider, item.item_id)
+            return (name_ref(item_id, item.name, artist), item.name) if item_id else None
         item_id = self.catalog.apple_item_id(item)
         return (name_ref(item_id, item.name, artist), item.name) if item_id else None
 

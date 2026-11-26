@@ -27,6 +27,7 @@ from .constants import (
     CONF_PASSWORD_PREFIX,
     CONF_PORT,
     CONF_SERVER_TYPE,
+    CONF_YOUTUBE_SEARCH,
     DEFAULT_BIND_IP,
     DEFAULT_PORT,
     SERVER_TYPE_MA,
@@ -105,6 +106,11 @@ class SubsonicServerProvider(PluginProvider):
             ),
             ConfigEntry(
                 key=CONF_APPLE_SEARCH,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=True,
+            ),
+            ConfigEntry(
+                key=CONF_YOUTUBE_SEARCH,
                 type=ConfigEntryType.BOOLEAN,
                 default_value=True,
             ),

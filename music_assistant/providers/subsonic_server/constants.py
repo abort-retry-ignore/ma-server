@@ -18,6 +18,7 @@ CONF_LOG_REQUESTS: Final = "log_requests"
 CONF_SERVER_TYPE: Final = "server_type"
 CONF_PASSWORD_PREFIX: Final = "password_"
 CONF_APPLE_SEARCH: Final = "apple_search"
+CONF_YOUTUBE_SEARCH: Final = "youtube_search"
 DEFAULT_PORT: Final = 4040
 DEFAULT_BIND_IP: Final = "0.0.0.0"
 
@@ -43,6 +44,11 @@ DEFAULT_SEARCH_COUNT: Final = 20
 # Apple Music catalogue: shortest query sent to Apple, results per type, how long results
 # are kept, how long a client waits for a song to be saved, and saves running at once
 APPLE_DOMAIN: Final = "apple_music"
+YOUTUBE_DOMAIN: Final = "ytmusic"
+# seconds between the starts of two YouTube Music saves (YouTube is quick to suspect bots)
+YOUTUBE_SAVE_GAP: Final = 3.0
+# YouTube Music audio is Opus at about 160 kbps: used to estimate a song not saved yet
+YOUTUBE_BIT_RATE: Final = 160
 APPLE_SEARCH_MIN_LENGTH: Final = 3
 APPLE_SEARCH_LIMIT: Final = 25
 APPLE_TTL: Final = 600

@@ -16,6 +16,10 @@
       "label": "Include Apple Music in search",
       "description": "Search results also list Apple Music songs, albums and artists. Playing a song that isn't saved yet saves it first, which takes a few seconds; after that it is an ordinary file in your music folder."
     },
+    "youtube_search": {
+      "label": "Include YouTube Music in search",
+      "description": "Search results also list YouTube Music songs, albums and artists that Apple Music didn't find, and YouTube Music playlists are shown. Playing a song that isn't saved yet saves it first (a few seconds, one song at a time)."
+    },
     "log_requests": {
       "label": "Log every request",
       "description": "Write each Subsonic call (without passwords) to the Music Assistant log. Useful while testing an app; errors are always logged."

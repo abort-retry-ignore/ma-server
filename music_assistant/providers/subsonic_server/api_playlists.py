@@ -10,7 +10,7 @@ from music_assistant_models.helpers import create_uri
 
 from .api_library import track_from_id
 from .apple import PREFIX_APPLE_TRACK, apple_id
-from .constants import APPLE_DOMAIN, ERR_GENERIC, ERR_NOT_AUTHORIZED
+from .constants import ERR_GENERIC, ERR_NOT_AUTHORIZED
 from .context import RequestContext, api_method
 from .index import IndexedTrack
 from .mapping import EMPTY_DATE, PREFIX_PLAYLIST, iso_time, make_id
@@ -82,11 +82,11 @@ async def update_playlist(ctx: RequestContext) -> dict[str, Any]:
 
 @api_method("deletePlaylist")
 async def delete_playlist(ctx: RequestContext) -> dict[str, Any]:
-    """Delete one of MA's own playlists (Apple Music playlists are deleted in Apple Music)."""
+    """Delete one of MA's own playlists (streaming service playlists are deleted there)."""
     row = await ctx.server.playlists.row(ctx.require("id"))
     if row["provider_domain"] != BUILTIN:
         raise SubsonicError(
-            ERR_NOT_AUTHORIZED, "Apple Music playlists can only be deleted in Apple Music"
+            ERR_NOT_AUTHORIZED, "Streaming service playlists can only be deleted in that service"
         )
     await ctx.server.mass.music.remove_item_from_library(MediaType.PLAYLIST, int(row["item_id"]))
     return {}
@@ -167,13 +167,13 @@ async def _remove(ctx: RequestContext, playlist_id: int, positions: tuple[int, .
 
 def _track_uri(ctx: RequestContext, value: str) -> str:
     """
-    Return the uri of a visible song: a library uri, or an Apple Music uri.
+    Return the uri of a visible song: a library uri, or an Apple or YouTube Music uri.
 
     :param ctx: The request context.
     :param value: The Subsonic song ID.
     """
     if (ref := apple_id(value, PREFIX_APPLE_TRACK)) is not None:
-        return create_uri(MediaType.TRACK, APPLE_DOMAIN, ref[1])
+        return ctx.server.catalog.uris(ref[1])[0]
     return create_uri(MediaType.TRACK, "library", str(track_from_id(ctx, value).id))
 
 

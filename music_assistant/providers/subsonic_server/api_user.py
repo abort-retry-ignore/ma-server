@@ -318,23 +318,21 @@ def _count_play(ctx: RequestContext, track: IndexedTrack) -> None:
 
 async def _star_apple(ctx: RequestContext, ref: tuple[str, str], favorite: bool) -> None:
     """
-    Add an Apple Music song, album or artist to MA's favourites, or remove it.
+    Add an Apple or YouTube Music song, album or artist to MA's favourites, or remove it.
 
     :param ctx: The request context.
-    :param ref: The Apple prefix and id.
+    :param ref: The catalogue prefix and id.
     :param favorite: True to add, False to remove.
     """
     media_type = APPLE_MEDIA_TYPES[ref[0]]
     music = ctx.server.mass.music
-    provider = ctx.server.catalog.provider
-    if provider is None:
-        raise SubsonicError(ERR_NOT_FOUND, "Apple Music is not available")
+    provider, real_id = ctx.server.catalog.provider_for(ref[1])
     try:
         if favorite:
-            await music.add_item_to_favorites(create_uri(media_type, provider.instance_id, ref[1]))
+            await music.add_item_to_favorites(create_uri(media_type, provider.instance_id, real_id))
             return
         library_item = await music.get_library_item_by_prov_id(
-            media_type, ref[1], provider.instance_id
+            media_type, real_id, provider.instance_id
         )
         if library_item is not None:
             await music.remove_item_from_favorites(media_type, library_item.item_id)
@@ -345,10 +343,10 @@ async def _star_apple(ctx: RequestContext, ref: tuple[str, str], favorite: bool)
 
 async def _scrobble_apple(ctx: RequestContext, item_id: str, submission: bool) -> None:
     """
-    Record a play of (or "now playing" for) an Apple Music song that has no file yet.
+    Record a play of (or "now playing" for) an Apple or YouTube Music song without a file.
 
     :param ctx: The request context.
-    :param item_id: The Apple Music track id.
+    :param item_id: The catalogue track id.
     :param submission: True for a finished play, False for "now playing".
     """
     assert ctx.user is not None
@@ -358,7 +356,7 @@ async def _scrobble_apple(ctx: RequestContext, item_id: str, submission: bool) -
             ctx.server.now_playing[(ctx.user.username, ctx.client)] = NowPlaying(
                 entry, ctx.user.username, ctx.client, time.time()
             )
-        ctx.note = f" (now playing '{track.name}' from Apple Music)"
+        ctx.note = f" (now playing '{track.name}' from {ctx.server.catalog.service_name(item_id)})"
         return
     await ctx.server.mass.music.mark_item_played(
         track,
@@ -367,4 +365,4 @@ async def _scrobble_apple(ctx: RequestContext, item_id: str, submission: bool) -
         userid=ctx.user.user_id,
         user_initiated=True,
     )
-    ctx.note = f" (played '{track.name}' from Apple Music)"
+    ctx.note = f" (played '{track.name}' from {ctx.server.catalog.service_name(item_id)})"
