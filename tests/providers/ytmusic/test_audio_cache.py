@@ -237,6 +237,54 @@ async def test_complete_stream_is_published_without_reencoding(
             assert audio["MA_YOUTUBE_MUSIC_ID"] == [ITEM_ID]
 
 
+async def test_known_size_is_fetched_in_byte_ranges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source of known size is fetched range by range (YouTube throttles long responses)."""
+    monkeypatch.setattr("music_assistant.providers.ytmusic.audio_cache._RANGE_SIZE", 4096)
+    source = tmp_path / "source.webm"
+    _make_audio(source, "libopus")
+    data = source.read_bytes()
+    requests: list[str] = []
+
+    async def handle(request: web.Request) -> web.Response:
+        first, _, last = request.headers["Range"].removeprefix("bytes=").partition("-")
+        requests.append(request.headers["Range"])
+        start, end = int(first), int(last)
+        return web.Response(
+            body=data[start : end + 1],
+            status=206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(data)}"},
+        )
+
+    app = web.Application()
+    app.router.add_get("/audio", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    assert site._server is not None
+    port = site._server.sockets[0].getsockname()[1]  # type: ignore[attr-defined]
+    try:
+        async with ClientSession() as session:
+            provider = _provider(session, _track())
+            cache = YoutubeAudioCache(provider, str(tmp_path / "cache"), str(tmp_path / "library"))
+            assert await cache.setup()
+            download = YoutubeDownload(
+                url=f"http://127.0.0.1:{port}/audio",
+                source_format="webm",
+                extension="opus",
+                expected_size=len(data),
+            )
+            received = b"".join([c async for c in cache.stream_and_store(ITEM_ID, download)])
+    finally:
+        await runner.cleanup()
+    assert received == data
+    assert len(requests) == -(-len(data) // 4096)
+    assert requests[0] == "bytes=0-4095"
+    assert await cache.lookup(ITEM_ID) is not None
+
+
 @pytest.mark.parametrize("mode", ["partial_range", "wrong_size", "interrupted", "short_track"])
 async def test_partial_or_interrupted_stream_is_never_cached(tmp_path: Path, mode: str) -> None:
     """A finished partial HTTP response or early consumer close is not a complete track."""

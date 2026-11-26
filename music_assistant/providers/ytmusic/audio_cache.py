@@ -58,6 +58,8 @@ _UNSAFE_NAME = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
 _CONTENT_RANGE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 _DOWNLOAD_TIMEOUT = ClientTimeout(total=None, sock_connect=15, sock_read=60)
 _STALE_PART_SECONDS = 3600
+# byte range fetched per request; YouTube throttles long responses, not short ones
+_RANGE_SIZE = 1024 * 1024
 _COVER_RETRY_SECONDS = 3600
 _ACTIVE_DOWNLOADS: set[tuple[str, str]] = set()
 
@@ -190,7 +192,7 @@ class YoutubeAudioCache:
         await self._remove(self._entry_path(item_id))
         return True
 
-    async def stream_and_store(
+    async def stream_and_store(  # noqa: PLR0915
         self, item_id: str, download: YoutubeDownload
     ) -> AsyncGenerator[bytes]:
         """
@@ -216,21 +218,35 @@ class YoutubeAudioCache:
             headers.pop("Range", None)
             headers.pop("range", None)
             headers["Accept-Encoding"] = "identity"
-            async with self.provider.mass.http_session.get(
-                download.url, headers=headers, timeout=_DOWNLOAD_TIMEOUT
-            ) as response:
-                if response.status not in (200, 206):
-                    raise AudioError(f"YouTube Music audio request failed (HTTP {response.status})")
-                expected = response.content_length
-                whole_response = _is_whole_response(
-                    response.status, response.headers.get("Content-Range"), expected
-                )
-                async for chunk in response.content.iter_chunked(64 * 1024):
+            if download.expected_size:
+                # YouTube sends one long response at about twice playback speed, but serves
+                # short byte ranges at full speed: fetch the file range by range
+                expected = download.expected_size
+                async for chunk in self._ranged_download(download.url, headers, expected):
                     if sink is not None:
                         sink = await self._write_part(sink, chunk, part)
                     received += len(chunk)
                     yield chunk
+                whole_response = received == expected
                 reached_end = True
+            else:
+                async with self.provider.mass.http_session.get(
+                    download.url, headers=headers, timeout=_DOWNLOAD_TIMEOUT
+                ) as response:
+                    if response.status not in (200, 206):
+                        raise AudioError(
+                            f"YouTube Music audio request failed (HTTP {response.status})"
+                        )
+                    expected = response.content_length
+                    whole_response = _is_whole_response(
+                        response.status, response.headers.get("Content-Range"), expected
+                    )
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        if sink is not None:
+                            sink = await self._write_part(sink, chunk, part)
+                        received += len(chunk)
+                        yield chunk
+                    reached_end = True
         except (ClientError, TimeoutError) as err:
             raise AudioError(
                 f"YouTube Music audio transport failed: {type(err).__name__}"
@@ -254,6 +270,40 @@ class YoutubeAudioCache:
             finally:
                 if claimed:
                     _ACTIVE_DOWNLOADS.discard((self.root, item_id))
+
+    async def _ranged_download(
+        self, url: str, headers: dict[str, str], size: int
+    ) -> AsyncGenerator[bytes]:
+        """
+        Yield a file of known size, fetched in consecutive byte ranges.
+
+        :param url: The audio URL.
+        :param headers: The request headers (without a Range header).
+        :param size: The file size in bytes.
+        """
+        start = 0
+        while start < size:
+            end = min(start + _RANGE_SIZE, size) - 1
+            ranged = {**headers, "Range": f"bytes={start}-{end}"}
+            async with self.provider.mass.http_session.get(
+                url, headers=ranged, timeout=_DOWNLOAD_TIMEOUT
+            ) as response:
+                whole = start == 0 and response.status == 200
+                if response.status != 206 and not whole:
+                    raise AudioError(
+                        f"YouTube Music audio range request failed (HTTP {response.status})"
+                    )
+                got = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    got += len(chunk)
+                    yield chunk
+            if whole:
+                # the server ignored the range and sent the whole file: the caller checks
+                # that it is the expected size
+                return
+            if got != end - start + 1:
+                raise AudioError("YouTube Music audio range came back short")
+            start = end + 1
 
     async def refresh_metadata(self, item_id: str) -> None:
         """Publish known metadata and an album cover for a cached track."""
