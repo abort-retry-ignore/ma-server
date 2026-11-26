@@ -17,7 +17,7 @@ import time
 from collections import OrderedDict, defaultdict
 from typing import TYPE_CHECKING, Any, cast
 
-from music_assistant_models.enums import MediaType, ProviderType, StreamType
+from music_assistant_models.enums import ImageType, MediaType, ProviderType, StreamType
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.helpers import create_uri
 
@@ -29,8 +29,10 @@ from .constants import (
     APPLE_TTL,
     ERR_GENERIC,
     ERR_NOT_FOUND,
+    ICLOUD_URL_TTL,
     MAX_APPLE_SAVES,
 )
+from .index import normalize
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
@@ -49,35 +51,73 @@ _REAL_APPLE_ID = re.compile(r"^(\d+|[a-z]\.[A-Za-z0-9]+)$")
 # an artist or album known only by its name, written as "n" + the name in hex
 _NAME_REF = re.compile(r"^n((?:[0-9a-f]{2})+)$")
 _MAX_CACHED = 500
+_MAX_IMAGES = 5000
+_BRACKETS = re.compile(r"[\(\[][^\)\]]*[\)\]]")
 
 
-def name_ref(item_id: str, name: str) -> str:
+def name_ref(item_id: str, name: str, artist: str | None = None) -> str:
     """
     Return a usable id for an album or artist reference.
 
     MA's Apple Music provider uses the name as id when Apple gives no link to the artist or
-    album; such a reference is encoded so it can be looked up by name later.
+    album; such a reference is encoded (with the artist, for an album) so it can be looked
+    up by name later.
 
     :param item_id: The id of the reference.
     :param name: The name of the album or artist.
+    :param artist: The album's artist, to find the right album by name.
     """
     if _REAL_APPLE_ID.match(item_id):
         return item_id
-    return "n" + name.encode().hex()
+    text = f"{name}\x1f{artist}" if artist else name
+    return "n" + text.encode().hex()
 
 
-def _name_of(item_id: str) -> str | None:
+def is_name_ref(item_id: str) -> bool:
     """
-    Return the name of a reference made by ``name_ref``, or None for a real id.
+    Return whether an id was made by ``name_ref`` from a name.
+
+    :param item_id: The id.
+    """
+    return _NAME_REF.match(item_id) is not None
+
+
+def is_icloud_id(item_id: str) -> bool:
+    """
+    Return whether an Apple Music track id is a song that only lives in the iCloud library.
+
+    :param item_id: The Apple Music track id.
+    """
+    return item_id.startswith("i.")
+
+
+def image_sources(item: Any) -> list[tuple[str, str]]:
+    """
+    Return the (path, provider) of an item's square images, then its wide ones.
+
+    :param item: A media item.
+    """
+    metadata = getattr(item, "metadata", None)
+    images = list(metadata.images or []) if metadata else []
+    ordered = [i for i in images if i.type == ImageType.THUMB]
+    ordered += [i for i in images if i.type == ImageType.LANDSCAPE]
+    return [(i.path, i.provider) for i in ordered]
+
+
+def _name_of(item_id: str) -> tuple[str, str | None] | None:
+    """
+    Return (name, artist) of a reference made by ``name_ref``, or None for a real id.
 
     :param item_id: The id.
     """
     if (match := _NAME_REF.match(item_id)) is None:
         return None
     try:
-        return bytes.fromhex(match.group(1)).decode()
+        text = bytes.fromhex(match.group(1)).decode()
     except UnicodeDecodeError:
         return None
+    name, _, artist = text.partition("\x1f")
+    return name, artist or None
 
 
 def apple_id(value: str | None, *allowed: str) -> tuple[str, str] | None:
@@ -114,6 +154,50 @@ class AppleCatalog:
             lambda: asyncio.Semaphore(1)
         )
         self._all_slots = asyncio.Semaphore(MAX_APPLE_SAVES)
+        self._images: OrderedDict[str, list[tuple[str, str]]] = OrderedDict()
+        self._icloud_urls: dict[str, tuple[float, str]] = {}
+
+    def remember_images(self, cover_id: str, item: Any) -> None:
+        """
+        Remember the images that came with an item, so its cover needs no Apple request.
+
+        :param cover_id: The cover art ID the item is shown with.
+        :param item: The song, album or artist from MA.
+        """
+        if sources := image_sources(item):
+            self._images[cover_id] = sources
+            self._images.move_to_end(cover_id)
+            while len(self._images) > _MAX_IMAGES:
+                self._images.popitem(last=False)
+
+    def remembered_images(self, cover_id: str) -> list[tuple[str, str]] | None:
+        """
+        Return the remembered images of a cover art ID, or None.
+
+        :param cover_id: The cover art ID.
+        """
+        return self._images.get(cover_id)
+
+    async def icloud_url(self, item_id: str, fresh: bool = False) -> str:
+        """
+        Return the download link of a song that only lives in the iCloud library.
+
+        Such songs are not encrypted; the link is reused for a while to spare Apple requests.
+
+        :param item_id: The Apple Music track id ("i.…").
+        :param fresh: Ask Apple for a new link.
+        """
+        cached = self._icloud_urls.get(item_id)
+        if cached is not None and cached[0] > time.monotonic() and not fresh:
+            return cached[1]
+        try:
+            details = await self._streams().get_stream_details(item_id)
+        except MusicAssistantError as err:
+            raise SubsonicError(ERR_GENERIC, f"Apple Music: {err}") from err
+        if details.stream_type != StreamType.HTTP or not details.path:
+            raise SubsonicError(ERR_GENERIC, "This song can't be played")
+        self._icloud_urls[item_id] = (time.monotonic() + ICLOUD_URL_TTL, str(details.path))
+        return str(details.path)
 
     @property
     def provider(self) -> Any | None:
@@ -334,15 +418,28 @@ class AppleCatalog:
         :param media_type: Album or artist.
         :raises SubsonicError: Not found (70) when the search finds nothing by that name.
         """
-        if (name := _name_of(item_id)) is None:
+        if (named := _name_of(item_id)) is None:
             return item_id
-        results = await self.search(name)
+        name, artist = named
+        key = ("real_id", item_id)
+        if (cached := self._get_cached(key)) is not None:
+            return cast("str", cached)
+        results = await self.search(f"{name} {artist}" if artist else name)
         found: list[Any] = []
         if results is not None:
             found = list(results.artists if media_type == MediaType.ARTIST else results.albums)
-        wanted = name.casefold()
-        for item in sorted(found, key=lambda i: i.name.casefold() != wanted):
+        wanted = normalize(_BRACKETS.sub(" ", name))
+        wanted_artist = normalize(artist or "")
+
+        def score(item: Any) -> tuple[bool, bool]:
+            names = " ".join(a.name for a in getattr(item, "artists", ()))
+            same_name = normalize(_BRACKETS.sub(" ", item.name)) == wanted
+            same_artist = not wanted_artist or wanted_artist in normalize(names)
+            return not same_name, not same_artist
+
+        for item in sorted(found, key=score):
             if (real := self.apple_item_id(item)) is not None:
+                self._put_cached(key, real)
                 return real
         raise SubsonicError(ERR_NOT_FOUND, f"Not found on Apple Music: {name}")
 

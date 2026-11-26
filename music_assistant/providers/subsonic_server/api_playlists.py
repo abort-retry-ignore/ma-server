@@ -100,7 +100,8 @@ async def _playlist_response(ctx: RequestContext, row: Mapping[str, Any]) -> dic
     :param ctx: The request context.
     :param row: The playlist's database row.
     """
-    items = await ctx.server.playlists.items(int(row["item_id"]), refresh=True)
+    book = ctx.server.playlists
+    items = await book.items(int(row["item_id"]), refresh=book.needs_fresh_read(row))
     songs = [entry for _, song in items if (entry := _song(ctx, song)) is not None]
     entry = _playlist_entry(ctx, row, len(songs), sum(int(s.get("duration") or 0) for s in songs))
     entry["entry"] = songs
@@ -145,6 +146,7 @@ async def _add(ctx: RequestContext, playlist_id: int, uris: list[str]) -> None:
         # the internal handler (as the smart playlist provider uses it) finishes the change
         # before this call returns, so the app sees it on its next request
         await ctx.server.mass.music.playlists._handle_add_playlist_tracks(playlist_id, uris)
+        ctx.server.playlists.mark_edited(playlist_id)
     except MusicAssistantError as err:
         raise SubsonicError(ERR_GENERIC, f"Could not add the songs: {err}") from err
 
@@ -159,6 +161,7 @@ async def _remove(ctx: RequestContext, playlist_id: int, positions: tuple[int, .
     """
     try:
         await ctx.server.mass.music.playlists._handle_remove_playlist_tracks(playlist_id, positions)
+        ctx.server.playlists.mark_edited(playlist_id)
     except MusicAssistantError as err:
         raise SubsonicError(ERR_GENERIC, f"Could not remove the songs: {err}") from err
 

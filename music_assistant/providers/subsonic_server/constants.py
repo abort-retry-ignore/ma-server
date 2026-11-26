@@ -48,6 +48,8 @@ APPLE_SEARCH_LIMIT: Final = 25
 APPLE_TTL: Final = 600
 APPLE_SAVE_TIMEOUT: Final = 55
 MAX_APPLE_SAVES: Final = 2
+# how long the download link of an iCloud-only song is reused
+ICLOUD_URL_TTL: Final = 600
 # Apple Music serves AAC at 256 kbps: used to estimate the size of a song not saved yet
 APPLE_BIT_RATE: Final = 256
 

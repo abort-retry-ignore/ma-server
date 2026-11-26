@@ -9,11 +9,13 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from music_assistant_models.enums import MediaType, StreamType
+from aiohttp import web
+from music_assistant_models.enums import ImageType, MediaType, StreamType
 from music_assistant_models.media_items import (
     Album,
     Artist,
     ItemMapping,
+    MediaItemImage,
     Playlist,
     ProviderMapping,
     SearchResults,
@@ -313,8 +315,11 @@ async def test_apple_playlists_show_with_their_songs(
     blocked = TRACKS["222"].__class__.from_dict(TRACKS["222"].to_dict())
     blocked.position = 3
 
-    async def _tracks(item_id: str, _provider: str, force_refresh: bool = False) -> Any:  # noqa: ARG001
+    reads: list[bool] = []
+
+    async def _tracks(item_id: str, _provider: str, force_refresh: bool = False) -> Any:
         assert int(item_id) == rock
+        reads.append(force_refresh)
         for item in (library_crom, apple_song, blocked):
             yield item
 
@@ -347,3 +352,85 @@ async def test_apple_playlists_show_with_their_songs(
     assert removed.await_args.args == (rock, (2,))
     refused = await server.call("deletePlaylist", id=f"pl-{rock}")
     assert refused["error"]["code"] == 50
+    # Apple playlists are read from MA's cache, except right after a change from the app
+    reads.clear()
+    await server.call("getPlaylist", id=f"pl-{rock}")
+    await server.call("getPlaylist", id=f"pl-{rock}")
+    assert reads == [True, False]
+
+
+@pytest.mark.usefixtures("apple")
+async def test_playlist_song_without_album_link_shows_its_own_cover(
+    server: Server,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A song listed without its album link gets its own picture, with no Apple search."""
+    assert server.provider.server is not None
+    catalog = server.provider.server.catalog
+    listed = _track("555", "Muxima")
+    listed.album = ItemMapping(
+        media_type=MediaType.ALBUM,
+        item_id="Angola Soundtrack",
+        provider=APPLE,
+        name="Angola Soundtrack",
+    )
+    listed.metadata.add_image(
+        MediaItemImage(type=ImageType.THUMB, path="https://art.example/555.jpg", provider=APPLE)
+    )
+    monkeypatch.setattr(catalog, "track", AsyncMock(return_value=listed))
+    searched = AsyncMock(return_value=SearchResults())
+    monkeypatch.setattr(catalog, "search", searched)
+    thumbs: list[str] = []
+
+    async def _thumbnail(path: str, *_args: Any, **_kwargs: Any) -> bytes:
+        thumbs.append(path)
+        return b"\xff\xd8\xff" + b"0" * 20
+
+    monkeypatch.setattr(server.mass.metadata, "get_thumbnail", _thumbnail)
+    song = (await server.call("getSong", id="amt-555"))["song"]
+    assert song["coverArt"] == "amt-555"
+    assert song["albumId"] == "ama-n" + b"Angola Soundtrack\x1fBasil Poledouris".hex()
+    art = await server.get("getCoverArt", id="amt-555", size=32)
+    assert art.status == 200
+    assert thumbs == ["https://art.example/555.jpg"]
+    album_art = await server.get("getCoverArt", id=song["albumId"], size=32)
+    assert album_art.status == 200
+    assert (await album_art.json(content_type=None))["subsonic-response"]["error"]["code"] == 70
+    searched.assert_not_awaited()
+
+
+@pytest.mark.usefixtures("apple")
+async def test_icloud_song_passes_through_with_ranges(
+    server: Server,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A song that only lives in iCloud is passed through from Apple's link, ranges included."""
+    assert server.provider.server is not None
+    catalog = server.provider.server.catalog
+    audio = tmp_path / "upload.mp3"
+    audio.write_bytes(b"ID3" + bytes(range(256)) * 10)
+
+    async def _serve(_request: web.Request) -> web.StreamResponse:
+        return web.FileResponse(audio, headers={"Content-Type": "audio/mpeg"})
+
+    app = web.Application()
+    app.router.add_get("/song", _serve)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+    try:
+        monkeypatch.setattr(
+            catalog, "icloud_url", AsyncMock(return_value=f"http://127.0.0.1:{port}/song")
+        )
+        full = await server.get("stream", id="amt-i.ABC123")
+        assert full.status == 200
+        assert full.headers["Content-Type"] == "audio/mpeg"
+        assert await full.read() == audio.read_bytes()
+        part = await server.get("stream", id="amt-i.ABC123", headers={"Range": "bytes=3-6"})
+        assert part.status == 206
+        assert await part.read() == bytes(range(4))
+    finally:
+        await runner.cleanup()

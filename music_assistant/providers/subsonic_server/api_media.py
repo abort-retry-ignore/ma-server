@@ -14,8 +14,8 @@ from aiohttp import web
 from music_assistant_models.errors import MusicAssistantError
 
 from .api_library import track_from_id
-from .apple import PREFIX_APPLE_TRACK, apple_id
-from .constants import ERR_NOT_FOUND
+from .apple import PREFIX_APPLE_TRACK, apple_id, is_icloud_id
+from .constants import ERR_GENERIC, ERR_NOT_FOUND
 from .context import RequestContext, api_method
 from .index import normalize
 from .mapping import PREFIX_TRACK, make_id
@@ -24,6 +24,14 @@ from .responses import SubsonicError
 if TYPE_CHECKING:
     from .index import IndexedTrack
 
+PASSED_HEADERS = (
+    "Content-Type",
+    "Content-Length",
+    "Content-Range",
+    "Accept-Ranges",
+    "Last-Modified",
+    "ETag",
+)
 LRC_TIME = re.compile(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]")
 LRC_TAG = re.compile(r"^\[[a-zA-Z]+:.*\]$")
 LRC_OFFSET = re.compile(r"^\[offset:\s*([+-]?\d+)\s*\]$", re.IGNORECASE)
@@ -128,6 +136,8 @@ async def _apple_file(ctx: RequestContext, item_id: str) -> web.StreamResponse:
     :param item_id: The Apple Music track id.
     """
     catalog = ctx.server.catalog
+    if is_icloud_id(item_id):
+        return await _icloud_stream(ctx, item_id)
     started = time.monotonic()
     path = await catalog.ensure_file(item_id, ctx.user_id)
     waited = time.monotonic() - started
@@ -143,6 +153,44 @@ async def _apple_file(ctx: RequestContext, item_id: str) -> web.StreamResponse:
         name = urllib.parse.quote(f"{track.name}.m4a")
         headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{name}"
     return web.FileResponse(path, headers=headers)
+
+
+async def _icloud_stream(ctx: RequestContext, item_id: str) -> web.StreamResponse:
+    """
+    Pass a song that only lives in the iCloud library through from Apple, ranges included.
+
+    Such songs are not encrypted, so they need no saving first.
+
+    :param ctx: The request context.
+    :param item_id: The Apple Music track id ("i.…").
+    """
+    catalog = ctx.server.catalog
+    request = ctx.request
+    headers = {}
+    if range_header := request.headers.get("Range"):
+        headers["Range"] = range_header
+    session = ctx.server.mass.http_session
+    for fresh in (False, True):
+        url = await catalog.icloud_url(item_id, fresh=fresh)
+        async with session.request(request.method, url, headers=headers) as upstream:
+            if upstream.status in (401, 403, 404, 410) and not fresh:
+                # the link expired: ask Apple for a new one
+                continue
+            if upstream.status >= 400:
+                raise SubsonicError(ERR_GENERIC, f"Apple Music answered {upstream.status}")
+            response = web.StreamResponse(status=upstream.status)
+            for name in PASSED_HEADERS:
+                if (value := upstream.headers.get(name)) is not None:
+                    response.headers[name] = value
+            response.headers.setdefault("Accept-Ranges", "bytes")
+            ctx.note = " (iCloud song passed through)"
+            await response.prepare(request)
+            if request.method != "HEAD":
+                async for chunk in upstream.content.iter_chunked(64 * 1024):
+                    await response.write(chunk)
+            await response.write_eof()
+            return response
+    raise SubsonicError(ERR_GENERIC, "Apple Music link expired")
 
 
 def _checked_path(ctx: RequestContext, track: IndexedTrack) -> str:

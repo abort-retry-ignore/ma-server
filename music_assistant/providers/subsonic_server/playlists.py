@@ -51,7 +51,32 @@ class PlaylistBook:
         self.logger = server.logger
         # playlist id -> (song count, duration, playlist's timestamp_modified, when counted)
         self._counts: dict[int, tuple[int, int, int, float]] = {}
+        self._edited: set[int] = set()
         self._task: asyncio.Task[None] | None = None
+
+    def mark_edited(self, playlist_id: int) -> None:
+        """
+        Note that a playlist was changed, so the next read skips MA's cache.
+
+        :param playlist_id: The library playlist id.
+        """
+        self._edited.add(playlist_id)
+
+    def needs_fresh_read(self, row: Mapping[str, Any]) -> bool:
+        """
+        Return whether to read a playlist fresh rather than from MA's cache.
+
+        MA's own playlists are local and cheap to read; an Apple Music playlist is only read
+        fresh after it was changed from a Subsonic app, so that apps syncing every playlist
+        don't send a request to Apple for each one.
+
+        :param row: The playlist's database row.
+        """
+        playlist_id = int(row["item_id"])
+        if playlist_id in self._edited:
+            self._edited.discard(playlist_id)
+            return True
+        return bool(row["provider_domain"] == BUILTIN)
 
     def start(self) -> None:
         """Start counting songs in the background."""

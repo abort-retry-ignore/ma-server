@@ -15,7 +15,7 @@ from music_assistant_models.enums import ImageType
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Album, Track
 
-from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_TRACK, apple_id
+from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_TRACK, apple_id, is_name_ref
 from .index import normalize
 from .mapping import PREFIX_ALBUM, PREFIX_ARTIST, PREFIX_PLAYLIST, PREFIX_TRACK, parse_id
 from .responses import SubsonicError
@@ -156,9 +156,14 @@ class Artwork:
         :param item_id: The Apple Music id.
         """
         catalog = self.server.catalog
+        if prefix == PREFIX_APPLE_TRACK and (saved := catalog.library_track(item_id)) is not None:
+            return await self._sources(PREFIX_TRACK, saved.id)
+        if (remembered := catalog.remembered_images(f"{prefix}-{item_id}")) is not None:
+            return remembered
+        if is_name_ref(item_id):
+            # known only by name: finding it would take an Apple search, too much for a cover
+            return []
         if prefix == PREFIX_APPLE_TRACK:
-            if (saved := catalog.library_track(item_id)) is not None:
-                return await self._sources(PREFIX_TRACK, saved.id)
             item: Any = await catalog.track(item_id)
             images = _thumbs(item)
             if isinstance(item.album, Album):
