@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -179,6 +180,10 @@ class SubsonicServer:
                 ctx.ratings = await self.storage.get_ratings(ctx.user.user_id)
             await self.index.ensure_built()
             result = await method.handler(ctx)
+        except asyncio.CancelledError:
+            # the client hung up (e.g. it stopped waiting for an Apple Music song to be saved)
+            self._log_request(ctx, "cancelled: the client hung up", started)
+            raise
         except SubsonicError as err:
             outcome = f"error {err.code} ({err.message})"
             response: web.StreamResponse = render_error(self.head("failed"), err, fmt, callback)
