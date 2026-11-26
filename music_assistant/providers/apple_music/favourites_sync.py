@@ -126,6 +126,7 @@ class FavouriteSongsSync:
         :param known: The Apple Music track ids whose rating answer was sure.
         """
         loved = {item_id for item_id, favourite in apple_favourites.items() if favourite}
+        elsewhere = await self._in_other_libraries()
         rows = await self.mass.music.database.get_rows_from_query(
             "SELECT t.item_id, t.name, t.favorite, pm.provider_item_id FROM tracks t "
             "JOIN provider_mappings pm ON pm.item_id = t.item_id AND pm.media_type = 'track' "
@@ -164,7 +165,8 @@ class FavouriteSongsSync:
             if not track["favorite"]:
                 continue
             if track_id in previous:
-                remove.append(track_id)
+                if track_id not in elsewhere:
+                    remove.append(track_id)
             else:
                 push.append((track_id, ids[0]))
         favourites = sum(1 for t in tracks.values() if t["favorite"])
@@ -210,3 +212,19 @@ class FavouriteSongsSync:
             category=CACHE_CATEGORY,
             expiration=60 * 60 * 24 * 365,
         )
+
+    async def _in_other_libraries(self) -> set[int]:
+        """
+        Return library songs that another streaming service also has in its library.
+
+        Their MA favourite may come from that service (a YouTube Music like, say), so Apple
+        Music not loving them is no reason to unmark them.
+        """
+        rows = await self.mass.music.database.get_rows_from_query(
+            "SELECT DISTINCT item_id FROM provider_mappings WHERE media_type = 'track' "
+            "AND in_library = 1 AND provider_instance != :instance "
+            "AND provider_domain NOT LIKE 'filesystem%' AND provider_domain != 'builtin'",
+            {"instance": self.instance_id},
+            limit=0,
+        )
+        return {int(row["item_id"]) for row in rows}

@@ -42,16 +42,25 @@ class FakeCache:
         self.data[key] = data
 
 
-def _sync(rows: list[dict[str, Any]], cache: FakeCache | None = None) -> tuple[Any, Any, AsyncMock]:
+def _sync(
+    rows: list[dict[str, Any]], cache: FakeCache | None = None, elsewhere: tuple[int, ...] = ()
+) -> tuple[Any, Any, AsyncMock]:
     """
     Return a sync over the given library rows, the fake mass and the Apple "love" mock.
 
     :param rows: Library track rows: item_id, name, favorite, provider_item_id.
     :param cache: The cache to use.
+    :param elsewhere: Library ids that another streaming service has in its library.
     """
+
+    async def _rows(query: str, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        if "DISTINCT item_id" in query:
+            return [{"item_id": i} for i in elsewhere]
+        return rows
+
     mass = SimpleNamespace(
         music=SimpleNamespace(
-            database=SimpleNamespace(get_rows_from_query=AsyncMock(return_value=rows)),
+            database=SimpleNamespace(get_rows_from_query=_rows),
             tracks=SimpleNamespace(set_favorite=AsyncMock()),
         ),
         cache=cache or FakeCache(),
@@ -131,3 +140,11 @@ async def test_recorder_only_trusts_answered_batches() -> None:
     await client.get_ratings(["9"], MediaType.ALBUM)
     recorder.detach()
     assert client.get_data.await_count == 2
+
+
+async def test_song_liked_on_another_service_is_not_unmarked() -> None:
+    """A favourite that YouTube Music also has in its library stays, even if Apple doesn't love it."""
+    rows = [_row(1, "a", True), _row(2, "b", True)]
+    sync, mass, _love = _sync(rows, elsewhere=(2,))
+    await sync.reconcile({"a": False, "b": False}, known={"a", "b"})
+    mass.music.tracks.set_favorite.assert_awaited_once_with(1, False)
