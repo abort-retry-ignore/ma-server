@@ -24,6 +24,7 @@ from .mapping import (
     PREFIX_ALBUM,
     PREFIX_ARTIST,
     PREFIX_TRACK,
+    iso_time,
     make_id,
     parse_id,
 )
@@ -32,6 +33,8 @@ from .responses import SubsonicError
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+# the most favourite songs without a file listed as Apple Music songs
+MAX_FAVOURITES = 2000
 IMAGE_SIZES = (("smallImageUrl", 300), ("mediumImageUrl", 600), ("largeImageUrl", 1200))
 
 
@@ -282,9 +285,37 @@ async def get_starred(ctx: RequestContext) -> dict[str, Any]:
             ctx.mapper.album(a) if id3 else ctx.mapper.album_child(a)
             for a in sorted(albums, key=lambda a: a.sort_name)
         ]
-    if tracks:
-        result["song"] = [ctx.mapper.song(t) for t in sorted(tracks, key=lambda t: t.sort_name)]
+    songs = [ctx.mapper.song(t) for t in sorted(tracks, key=lambda t: t.sort_name)]
+    songs += await _apple_favourites(ctx, {t.id for t in tracks})
+    if songs:
+        result["song"] = songs
     return {"starred2" if id3 else "starred": result}
+
+
+async def _apple_favourites(ctx: RequestContext, shown: set[int]) -> list[dict[str, Any]]:
+    """
+    Return the MA favourite songs that have no file yet as Apple Music songs.
+
+    :param ctx: The request context.
+    :param shown: Library ids of favourite songs already listed (with a file).
+    """
+    if not ctx.server.catalog.enabled:
+        return []
+    favourites = await ctx.server.mass.music.tracks.library_items(
+        favorite=True, limit=MAX_FAVOURITES, summary=False
+    )
+    songs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for track in sorted(favourites, key=lambda t: (t.sort_name or t.name).casefold()):
+        if int(track.item_id) in shown or not isinstance(track, Track):
+            continue
+        entry = ctx.mapper.apple_song(track)
+        if entry is None or entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+        entry["starred"] = entry.get("starred") or iso_time(time.time())
+        songs.append(entry)
+    return songs
 
 
 @api_method("getNowPlaying")

@@ -459,3 +459,23 @@ async def test_icloud_song_passes_through_with_ranges(
         assert await part.read() == bytes(range(4))
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.usefixtures("apple")
+async def test_apple_only_favourites_are_starred(
+    server: Server,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A favourite in MA without a file shows in the app's starred songs as an Apple song."""
+    added = await server.mass.music.tracks.add_item_to_library(_track("777", "Lucky Girl"))
+    await server.mass.music.tracks.set_favorite(added.item_id, True)
+    favourite = await server.mass.music.tracks.get_library_item(added.item_id)
+    # MA leaves out items of a provider that isn't loaded (the fake Apple Music here)
+    monkeypatch.setattr(
+        server.mass.music.tracks, "library_items", AsyncMock(return_value=[favourite])
+    )
+    starred = (await server.call("getStarred2"))["starred2"]
+    songs = {s["id"]: s for s in starred.get("song", [])}
+    assert "amt-777" in songs
+    assert songs["amt-777"]["starred"]
+    assert songs["amt-777"]["title"] == "Lucky Girl"

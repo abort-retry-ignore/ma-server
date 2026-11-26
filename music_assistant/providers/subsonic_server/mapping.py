@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -372,6 +373,7 @@ class Mapper:
             "albumId": album_id,
             "artistId": make_id(PREFIX_APPLE_ARTIST, artists[0][0]) if artists else None,
             "type": "music",
+            "starred": iso_time(time.time()) if track.favorite else None,
             "userRating": self.ratings.get(song_id),
             "bpm": 0,
             "comment": "",
