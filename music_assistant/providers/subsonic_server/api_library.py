@@ -346,8 +346,8 @@ async def search(ctx: RequestContext) -> dict[str, Any]:
     """
     Search artists, albums and songs; an empty query lists everything, page by page.
 
-    The music folder comes first; Apple Music results follow, then YouTube Music results that
-    neither of those has, when they are enabled.
+    The music folder comes first; then library items without a file that Apple or YouTube
+    Music can play, Apple Music results, and YouTube Music results that none of those has.
     """
     query = ctx.get("query", "") or ""
     folder_id = ctx.folder_id()
@@ -365,9 +365,11 @@ async def search(ctx: RequestContext) -> dict[str, Any]:
     if song_offset == 0 and query.strip('" '):
         tracks = await _with_heard_tracks_first(ctx, query, tracks)
     if catalog.enabled:
-        apple, youtube = await asyncio.gather(catalog.search(query), catalog.search_youtube(query))
+        library, apple, youtube = await asyncio.gather(
+            catalog.search_library(query), catalog.search(query), catalog.search_youtube(query)
+        )
         songs_seen = {_song_key(ctx, t) for t in tracks}
-        for found, only_new_songs in ((apple, False), (youtube, True)):
+        for found, only_new_songs in ((library, False), (apple, False), (youtube, True)):
             if found is None:
                 continue
             known_artists = {normalize(a.name) for a in artists}
@@ -400,6 +402,10 @@ async def search(ctx: RequestContext) -> dict[str, Any]:
     ]
     if songs := [s for s in songs if s is not None]:
         result["song"] = songs
+    ctx.note = (
+        f" ({len(songs)} songs, {len(result.get('album', []))} albums, "
+        f"{len(result.get('artist', []))} artists)"
+    )
     return {"searchResult3" if id3 else "searchResult2": result}
 
 

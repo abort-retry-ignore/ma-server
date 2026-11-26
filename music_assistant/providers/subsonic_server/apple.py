@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 from music_assistant_models.enums import ImageType, MediaType, ProviderType, StreamType
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.helpers import create_uri
+from music_assistant_models.media_items import SearchResults
 
 from .constants import (
     APPLE_DOMAIN,
@@ -39,7 +40,7 @@ from .index import normalize
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
-    from music_assistant_models.media_items import Album, Artist, SearchResults, Track
+    from music_assistant_models.media_items import Album, Artist, Track
 
     from .index import IndexedTrack
     from .server import SubsonicServer
@@ -320,6 +321,34 @@ class AppleCatalog:
         """
         provider = self.provider if self.apple_enabled else None
         return await self._search_on(provider, "Apple Music", query)
+
+    async def search_library(self, query: str) -> SearchResults | None:
+        """
+        Return MA library items for a query that Apple or YouTube Music can play.
+
+        MA's search of a service leaves out what the library already holds, so library
+        songs, albums and artists without a file are found here instead.
+
+        :param query: The search text.
+        """
+        query = query.strip().strip('"').strip()
+        if not self.enabled or len(query) < APPLE_SEARCH_MIN_LENGTH:
+            return None
+        try:
+            results = await self.mass.music.search(
+                query,
+                [MediaType.ARTIST, MediaType.ALBUM, MediaType.TRACK],
+                limit=APPLE_SEARCH_LIMIT,
+                providers=["library"],
+            )
+        except MusicAssistantError as err:
+            self.logger.warning("Library search for '%s' failed: %s", query, err)
+            return None
+        return SearchResults(
+            artists=[a for a in results.artists if self._catalogue_id(a) is not None],
+            albums=[a for a in results.albums if self._catalogue_id(a) is not None],
+            tracks=[t for t in results.tracks if self._catalogue_id(t) is not None],
+        )
 
     async def search_youtube(self, query: str) -> SearchResults | None:
         """

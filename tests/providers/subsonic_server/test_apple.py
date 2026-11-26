@@ -517,3 +517,46 @@ async def test_playlist_change_date_follows_its_songs(
     grown = (await server.call("getPlaylist", id=f"pl-{hits}"))["playlist"]
     assert grown["songCount"] == 2
     assert grown["changed"] > first["changed"]
+
+
+@pytest.mark.usefixtures("apple")
+async def test_library_albums_without_a_file_are_found(
+    server: Server,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MA's Apple search skips what the library holds, so library items are searched too."""
+    metallica = Artist(
+        item_id="12", provider="library", name="Metallica", provider_mappings=_mapping("3")
+    )
+    library_album = Album(
+        item_id="448",
+        provider="library",
+        name="Master of Puppets",
+        artists=UniqueList([metallica]),
+        provider_mappings=_mapping("1442993557"),
+    )
+    local_only = Artist(
+        item_id="77",
+        provider="library",
+        name="Master of Nothing",
+        provider_mappings={
+            ProviderMapping(
+                item_id="x",
+                provider_domain="filesystem_local",
+                provider_instance="filesystem_local--x",
+            )
+        },
+    )
+
+    async def _search(_query: str, _types: Any, **kwargs: Any) -> SearchResults:
+        assert kwargs["providers"] == ["library"]
+        return SearchResults(artists=[local_only, metallica], albums=[library_album])
+
+    monkeypatch.setattr(server.mass.music, "search", _search)
+    found = (await server.call("search3", query="master of puppets"))["searchResult3"]
+    album_ids = [a["id"] for a in found["album"]]
+    assert album_ids[0] == "ama-1442993557"
+    assert "ama-800" in album_ids
+    artist_ids = [a["id"] for a in found.get("artist", [])]
+    assert "amr-3" in artist_ids
+    assert "amr-77" not in artist_ids
