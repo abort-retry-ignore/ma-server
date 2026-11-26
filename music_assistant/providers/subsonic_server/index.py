@@ -10,6 +10,7 @@ lookup, so a block applies at once.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import re
 import time
@@ -29,11 +30,12 @@ from .constants import CONTENT_TYPES, UNKNOWN_ALBUM
 
 if TYPE_CHECKING:
     import logging
-    from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
 
     from music_assistant.mass import MusicAssistant
 
 _NON_WORD = re.compile(r"[^\w]+")
+_BRACKETS = re.compile(r"[\(\[][^\)\]]*[\)\]]")
 
 
 @dataclass(slots=True)
@@ -149,7 +151,10 @@ class LibraryIndex:
         self.albums: dict[int, IndexedAlbum] = {}
         self.artists: dict[int, IndexedArtist] = {}
         self.track_by_uri: dict[str, int] = {}
+        self.track_by_key: dict[str, int] = {}
         self.last_modified = 0
+        # called after each build; returns when the set of items last changed (epoch seconds)
+        self.after_build: Callable[[LibraryIndex], Awaitable[float]] | None = None
         self.built_at = 0.0
         self._lock = asyncio.Lock()
         self._built = False
@@ -158,6 +163,24 @@ class LibraryIndex:
     def ready(self) -> bool:
         """Return whether the index was built at least once."""
         return self._built
+
+    def first_artist(self, track: IndexedTrack) -> str:
+        """
+        Return the name of a track's first artist, or an empty string.
+
+        :param track: The track.
+        """
+        if track.artist_ids and (artist := self.artists.get(track.artist_ids[0])) is not None:
+            return artist.name
+        return ""
+
+    def signature(self) -> str:
+        """Return a fingerprint of which tracks, albums and artists the index holds."""
+        digest = hashlib.sha1(usedforsecurity=False)
+        for ids in (self.tracks, self.albums, self.artists):
+            digest.update(",".join(str(i) for i in sorted(ids)).encode())
+            digest.update(b"|")
+        return digest.hexdigest()
 
     async def ensure_built(self) -> None:
         """Build the index if it was never built."""
@@ -173,9 +196,22 @@ class LibraryIndex:
             self.folders = folders
             self.tracks, self.albums, self.artists = tracks, albums, artists
             self.track_by_uri = {uri: t.id for t in tracks.values() for uri in t.uris}
+            self.track_by_key = {}
+            for track in sorted(tracks.values(), key=lambda t: t.id):
+                self.track_by_key.setdefault(
+                    song_key(track.name, self.first_artist(track)), track.id
+                )
             stamps = [t.timestamp_modified for t in tracks.values()]
             stamps += [a.timestamp_modified for a in albums.values()]
-            self.last_modified = max(stamps, default=0) * 1000
+            changed = 0.0
+            if self.after_build is not None:
+                try:
+                    changed = await self.after_build(self)
+                except Exception:
+                    self.logger.exception("Subsonic index: follow-up after the build failed")
+            # a removal leaves the newest change date alone, so the time the set of items
+            # last changed counts too: clients then know to refresh
+            self.last_modified = max(max(stamps, default=0) * 1000, int(changed * 1000))
             self.built_at = time.time()
             self._built = True
             self.logger.debug(
@@ -545,6 +581,16 @@ def normalize(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", text.casefold())
     stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
     return " ".join(_NON_WORD.sub(" ", stripped).split())
+
+
+def song_key(title: str, artist: str) -> str:
+    """
+    Return a key that is the same for one song on different services.
+
+    :param title: The song title.
+    :param artist: The (first) artist name.
+    """
+    return f"{normalize(_BRACKETS.sub(' ', title))}|{normalize(artist)}"
 
 
 def index_letter(sort_name: str) -> str:

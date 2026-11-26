@@ -38,6 +38,7 @@ from .constants import (
     SERVER_TYPE_NAVIDROME,
 )
 from .context import API_METHODS, NowPlaying, RequestContext
+from .gone import SONG_PARAMS, GoneSongs
 from .index import LibraryIndex
 from .playlists import PlaylistBook
 from .responses import SubsonicError, envelope, render, render_error
@@ -70,6 +71,8 @@ class SubsonicServer:
         self.artwork = Artwork(self)
         self.catalog = AppleCatalog(self)
         self.playlists = PlaylistBook(self)
+        self.gone_songs = GoneSongs(self)
+        self.index.after_build = self._index_built
         self.now_playing: dict[tuple[str, str], NowPlaying] = {}
         self._webserver = Webserver(self.logger)
         self._reported: set[tuple[str, str]] = set()
@@ -186,6 +189,7 @@ class SubsonicServer:
                 set_current_user(ctx.user)
                 ctx.ratings = await self.storage.get_ratings(ctx.user.user_id)
             await self.index.ensure_built()
+            await self._use_stand_ins(ctx)
             result = await method.handler(ctx)
         except asyncio.CancelledError:
             # the client hung up (e.g. it stopped waiting for an Apple Music song to be saved)
@@ -283,6 +287,45 @@ class SubsonicServer:
             ctx.note,
             (time.monotonic() - started) * 1000,
         )
+
+    async def _use_stand_ins(self, ctx: RequestContext) -> None:
+        """
+        Point song IDs of songs that left the library at the same song, when it is still there.
+
+        :param ctx: The request context (its parameters are replaced when an ID is).
+        """
+        replaced: dict[str, str] = {}
+        for name in SONG_PARAMS:
+            for value in ctx.params.getall(name, []):
+                if value not in replaced and (stand_in := await self.gone_songs.replacement(value)):
+                    replaced[value] = stand_in
+        if not replaced:
+            return
+        ctx.params = MultiDictProxy(
+            MultiDict(
+                (key, replaced.get(value, value) if key in SONG_PARAMS else value)
+                for key, value in ctx.params.items()
+            )
+        )
+        self.logger.info(
+            "Subsonic: %s left the library; using the same song: %s",
+            ", ".join(replaced),
+            ", ".join(replaced.values()),
+        )
+
+    async def _index_built(self, index: LibraryIndex) -> float:
+        """
+        Remember the songs clients can now see and return when the library content changed.
+
+        :param index: The freshly built index.
+        """
+        self.gone_songs.forget()
+        if not self.storage.ready:
+            return 0.0
+        await self.storage.remember_tracks(
+            {track.id: (track.name, index.first_artist(track)) for track in index.tracks.values()}
+        )
+        return await self.storage.content_changed(index.signature())
 
 
 async def _read_params(request: web.Request) -> MultiDictProxy[str]:

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Track
 
-from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK, apple_id, song_key
+from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK, apple_id
 from .constants import (
     DEFAULT_LIST_SIZE,
     DEFAULT_SEARCH_COUNT,
@@ -20,7 +20,7 @@ from .constants import (
     IGNORED_ARTICLES,
 )
 from .context import RequestContext, api_method
-from .index import IndexedAlbum, IndexedArtist, IndexedTrack, index_letter, normalize
+from .index import IndexedAlbum, IndexedArtist, IndexedTrack, index_letter, normalize, song_key
 from .mapping import (
     PREFIX_ALBUM,
     PREFIX_ARTIST,
@@ -441,9 +441,7 @@ def _song_key(ctx: RequestContext, track: IndexedTrack | Track) -> str:
     :param track: A song with a file, or a streaming service track.
     """
     if isinstance(track, IndexedTrack):
-        artists = ctx.server.index.artists
-        first = artists.get(track.artist_ids[0]) if track.artist_ids else None
-        return song_key(track.name, first.name if first else "")
+        return song_key(track.name, ctx.server.index.first_artist(track))
     return song_key(track.name, track.artists[0].name if track.artists else "")
 
 

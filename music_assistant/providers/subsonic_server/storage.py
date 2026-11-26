@@ -1,4 +1,9 @@
-"""The plugin's own small database: saved play queues, ratings and the image-link secret."""
+"""
+The plugin's own small database.
+
+It holds saved play queues, ratings, playlist states, the image-link secret, and the title and
+artist of every song clients have seen (to recognise old song IDs).
+"""
 
 from __future__ import annotations
 
@@ -17,7 +22,10 @@ TABLE_META = "meta"
 TABLE_PLAY_QUEUE = "play_queue"
 TABLE_RATINGS = "ratings"
 TABLE_PLAYLISTS = "playlist_state"
+TABLE_KNOWN_TRACKS = "known_tracks"
 META_IMAGE_SECRET = "image_secret"
+META_INDEX_SIGNATURE = "index_signature"
+META_INDEX_CHANGED = "index_changed"
 
 
 @dataclass
@@ -43,6 +51,7 @@ class Storage:
         self._path = os.path.join(storage_path, DB_FILE)
         self._db: DatabaseConnection | None = None
         self.image_secret = b""
+        self._known_tracks: dict[int, tuple[str, str]] = {}
 
     async def setup(self) -> None:
         """Open the database and create the tables."""
@@ -68,8 +77,16 @@ class Storage:
             "song_count INTEGER NOT NULL, duration INTEGER NOT NULL, changed REAL NOT NULL, "
             "counted REAL NOT NULL, stamp INTEGER NOT NULL DEFAULT 0)"
         )
+        await db.execute(
+            f"CREATE TABLE IF NOT EXISTS {TABLE_KNOWN_TRACKS} ("
+            "track_id INTEGER PRIMARY KEY, name TEXT NOT NULL, artist TEXT NOT NULL)"
+        )
         await db.commit()
         self._db = db
+        self._known_tracks = {
+            int(row["track_id"]): (str(row["name"]), str(row["artist"]))
+            for row in await db.get_rows(TABLE_KNOWN_TRACKS, limit=0)
+        }
         row = await db.get_row(TABLE_META, {"key": META_IMAGE_SECRET})
         if row:
             self.image_secret = bytes.fromhex(row["value"])
@@ -78,6 +95,57 @@ class Storage:
             await db.insert_or_replace(
                 TABLE_META, {"key": META_IMAGE_SECRET, "value": self.image_secret.hex()}
             )
+
+    @property
+    def ready(self) -> bool:
+        """Return whether the database is open."""
+        return self._db is not None
+
+    def known_track(self, track_id: int) -> tuple[str, str] | None:
+        """
+        Return the title and first artist a library song had when clients last saw it.
+
+        :param track_id: The library track id.
+        """
+        return self._known_tracks.get(track_id)
+
+    async def remember_tracks(self, tracks: dict[int, tuple[str, str]]) -> None:
+        """
+        Remember the title and first artist of the songs clients can see.
+
+        :param tracks: Library track id -> (title, first artist).
+        """
+        assert self._db is not None
+        changed = {k: v for k, v in tracks.items() if self._known_tracks.get(k) != v}
+        if not changed:
+            return
+        await self._db.upsert_many(
+            TABLE_KNOWN_TRACKS,
+            [
+                {"track_id": track_id, "name": name, "artist": artist}
+                for track_id, (name, artist) in changed.items()
+            ],
+        )
+        await self._db.commit()
+        self._known_tracks.update(changed)
+
+    async def content_changed(self, signature: str) -> float:
+        """
+        Return when the library content last changed, noting a change now if it differs.
+
+        :param signature: The fingerprint of the current library content.
+        """
+        assert self._db is not None
+        stored = await self._db.get_row(TABLE_META, {"key": META_INDEX_SIGNATURE})
+        changed = await self._db.get_row(TABLE_META, {"key": META_INDEX_CHANGED})
+        if stored and changed and stored["value"] == signature:
+            return float(changed["value"])
+        now = time.time()
+        await self._db.insert_or_replace(
+            TABLE_META, {"key": META_INDEX_SIGNATURE, "value": signature}
+        )
+        await self._db.insert_or_replace(TABLE_META, {"key": META_INDEX_CHANGED, "value": str(now)})
+        return now
 
     async def close(self) -> None:
         """Close the database."""

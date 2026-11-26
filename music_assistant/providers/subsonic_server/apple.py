@@ -87,16 +87,6 @@ def is_name_ref(item_id: str) -> bool:
     return _NAME_REF.match(item_id) is not None
 
 
-def song_key(title: str, artist: str) -> str:
-    """
-    Return a key that is the same for one song on different services.
-
-    :param title: The song title.
-    :param artist: The (first) artist name.
-    """
-    return f"{normalize(_BRACKETS.sub(' ', title))}|{normalize(artist)}"
-
-
 def is_youtube_id(item_id: str) -> bool:
     """
     Return whether a catalogue id is a YouTube Music one.
