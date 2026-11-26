@@ -32,7 +32,6 @@ from .mapping import (
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
-
     from music_assistant_models.auth import User
 
     from .index import IndexedTrack
