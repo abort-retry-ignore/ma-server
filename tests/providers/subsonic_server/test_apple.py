@@ -393,10 +393,35 @@ async def test_playlist_song_without_album_link_shows_its_own_cover(
     art = await server.get("getCoverArt", id="amt-555", size=32)
     assert art.status == 200
     assert thumbs == ["https://art.example/555.jpg"]
+    # the album known only by name shows its songs' art, also under the older id format
     album_art = await server.get("getCoverArt", id=song["albumId"], size=32)
     assert album_art.status == 200
-    assert (await album_art.json(content_type=None))["subsonic-response"]["error"]["code"] == 70
+    assert album_art.headers["Content-Type"] == "image/jpeg"
+    legacy = "ama-n" + b"Angola Soundtrack".hex()
+    assert (await server.get("getCoverArt", id=legacy, size=32)).status == 200
     searched.assert_not_awaited()
+    # an album never seen before is found by a search, then its cover is shown
+    unseen = Album(
+        item_id="801",
+        provider=APPLE,
+        name="Together",
+        artists=UniqueList([ARTIST]),
+        provider_mappings=_mapping("801"),
+    )
+    unseen.metadata.add_image(
+        MediaItemImage(type=ImageType.THUMB, path="https://art.example/801.jpg", provider=APPLE)
+    )
+    searched.return_value = SearchResults(albums=[unseen])
+    monkeypatch.setattr(catalog, "album", AppleCatalog.album.__get__(catalog))
+
+    async def _get(kind: str, item_id: str, _getter: Any) -> Any:
+        assert (kind, item_id) == ("album", "801")
+        return unseen
+
+    monkeypatch.setattr(catalog, "_get", _get)
+    found = await server.get("getCoverArt", id="ama-n" + b"Together".hex(), size=32)
+    assert found.status == 200
+    assert thumbs[-1] == "https://art.example/801.jpg"
 
 
 @pytest.mark.usefixtures("apple")

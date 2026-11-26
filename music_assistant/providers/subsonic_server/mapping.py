@@ -341,6 +341,12 @@ class Mapper:
         self.catalog.remember_images(song_id, track)
         if album is not None and album_id is not None:
             self.catalog.remember_images(album_id, album)
+        elif album_ref is not None and album_id is not None and cover_id == song_id:
+            # an album known only by name: its songs carry the album art, so its cover is
+            # the song's picture (also under the id older app caches use, without the artist)
+            self.catalog.remember_images(album_id, track)
+            legacy = make_id(PREFIX_APPLE_ALBUM, name_ref(album_ref[0], album_ref[1]))
+            self.catalog.remember_images(legacy, track)
         genres = sorted(track.metadata.genres or []) if track.metadata else []
         title = display_name(track.name, track.version)
         album_name = album_ref[1] if album_ref else ""

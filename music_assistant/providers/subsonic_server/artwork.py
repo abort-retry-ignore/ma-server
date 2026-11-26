@@ -15,7 +15,7 @@ from music_assistant_models.enums import ImageType
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Album, Track
 
-from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_TRACK, apple_id, is_name_ref
+from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_TRACK, apple_id
 from .index import normalize
 from .mapping import PREFIX_ALBUM, PREFIX_ARTIST, PREFIX_PLAYLIST, PREFIX_TRACK, parse_id
 from .responses import SubsonicError
@@ -158,20 +158,26 @@ class Artwork:
         catalog = self.server.catalog
         if prefix == PREFIX_APPLE_TRACK and (saved := catalog.library_track(item_id)) is not None:
             return await self._sources(PREFIX_TRACK, saved.id)
-        if (remembered := catalog.remembered_images(f"{prefix}-{item_id}")) is not None:
+        cover_id = f"{prefix}-{item_id}"
+        if (remembered := catalog.remembered_images(cover_id)) is not None:
             return remembered
-        if is_name_ref(item_id):
-            # known only by name: finding it would take an Apple search, too much for a cover
-            return []
+        # not seen yet (e.g. after a restart, or an album known only by name, which takes a
+        # search): ask Apple through MA, which caches the answer, and remember the images
+        item: Any
         if prefix == PREFIX_APPLE_TRACK:
-            item: Any = await catalog.track(item_id)
+            item = await catalog.track(item_id)
             images = _thumbs(item)
             if isinstance(item.album, Album):
                 images += _thumbs(item.album)
-            return list(dict.fromkeys(images))
-        if prefix == PREFIX_APPLE_ALBUM:
-            return _thumbs(await catalog.album(item_id))
-        return _thumbs(await catalog.artist(item_id))
+            sources = list(dict.fromkeys(images))
+        elif prefix == PREFIX_APPLE_ALBUM:
+            item = await catalog.album(item_id)
+            sources = _thumbs(item)
+        else:
+            item = await catalog.artist(item_id)
+            sources = _thumbs(item)
+        catalog.remember_images(cover_id, item)
+        return sources
 
     async def _playlist_song_sources(self, playlist_id: int) -> list[tuple[str, str]]:
         """
