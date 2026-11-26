@@ -51,6 +51,13 @@ MAX_APPLE_SAVES: Final = 2
 # Apple Music serves AAC at 256 kbps: used to estimate the size of a song not saved yet
 APPLE_BIT_RATE: Final = 256
 
+# playlist song counts: first counting after start, pause between playlists, how often to
+# look for playlists without a fresh count, and how long a count stays fresh
+PLAYLIST_COUNT_START_DELAY: Final = 60
+PLAYLIST_COUNT_PAUSE: Final = 1.0
+PLAYLIST_COUNT_INTERVAL: Final = 1800
+PLAYLIST_COUNT_MAX_AGE: Final = 6 * 3600
+
 # rebuild the library index this long after the last library change
 INDEX_REBUILD_DELAY: Final = 3.0
 

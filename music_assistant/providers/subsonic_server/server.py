@@ -15,7 +15,12 @@ from multidict import MultiDict, MultiDictProxy
 from music_assistant.controllers.webserver.helpers.auth_middleware import set_current_user
 from music_assistant.helpers.webserver import Webserver
 
-from . import api_library, api_media, api_user  # noqa: F401  # registers the API methods
+from . import (  # noqa: F401  # registers the API methods
+    api_library,
+    api_media,
+    api_playlists,
+    api_user,
+)
 from .apple import AppleCatalog
 from .artwork import Artwork
 from .auth import Authenticator
@@ -32,6 +37,7 @@ from .constants import (
 )
 from .context import API_METHODS, NowPlaying, RequestContext
 from .index import LibraryIndex
+from .playlists import PlaylistBook
 from .responses import SubsonicError, envelope, render, render_error
 from .storage import Storage
 
@@ -61,6 +67,7 @@ class SubsonicServer:
         self.auth = Authenticator(provider.lookup_user, self.logger)
         self.artwork = Artwork(self)
         self.catalog = AppleCatalog(self)
+        self.playlists = PlaylistBook(self)
         self.now_playing: dict[tuple[str, str], NowPlaying] = {}
         self._webserver = Webserver(self.logger)
         self._reported: set[tuple[str, str]] = set()
@@ -91,6 +98,7 @@ class SubsonicServer:
 
     async def stop(self) -> None:
         """Stop listening and close the storage."""
+        await self.playlists.stop()
         await self._webserver.close()
         await self.storage.close()
 

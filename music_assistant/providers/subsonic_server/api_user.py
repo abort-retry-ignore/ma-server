@@ -15,17 +15,15 @@ from music_assistant_models.auth import UserRole
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.helpers import create_uri
-from music_assistant_models.media_items import Track
 
 from .api_library import song_entry, track_from_id
 from .apple import PREFIX_APPLE_ALBUM, PREFIX_APPLE_ARTIST, PREFIX_APPLE_TRACK, apple_id
-from .constants import APPLE_DOMAIN, ERR_GENERIC, ERR_NOT_AUTHORIZED, ERR_NOT_FOUND
+from .constants import ERR_GENERIC, ERR_NOT_AUTHORIZED, ERR_NOT_FOUND
 from .context import NowPlaying, RequestContext, api_method
 from .mapping import (
     EMPTY_DATE,
     PREFIX_ALBUM,
     PREFIX_ARTIST,
-    PREFIX_PLAYLIST,
     PREFIX_TRACK,
     iso_time,
     make_id,
@@ -34,7 +32,6 @@ from .mapping import (
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
 
     from music_assistant_models.auth import User
 
@@ -255,75 +252,6 @@ async def save_play_queue(ctx: RequestContext) -> dict[str, Any]:
     return {}
 
 
-@api_method("getPlaylists")
-async def get_playlists(ctx: RequestContext) -> dict[str, Any]:
-    """Return MA's own playlists."""
-    entries = []
-    for row in await _builtin_playlists(ctx):
-        songs = [song for _, song in await _playlist_tracks(ctx, row["item_id"])]
-        entries.append(_playlist_entry(ctx, row, songs))
-    return {"playlists": {"playlist": entries} if entries else {}}
-
-
-@api_method("getPlaylist")
-async def get_playlist(ctx: RequestContext) -> dict[str, Any]:
-    """Return one of MA's own playlists with its songs."""
-    row = await _playlist_row(ctx, ctx.require("id"))
-    songs = [song for _, song in await _playlist_tracks(ctx, row["item_id"])]
-    entry = _playlist_entry(ctx, row, songs)
-    entry["entry"] = songs
-    return {"playlist": entry}
-
-
-@api_method("createPlaylist")
-async def create_playlist(ctx: RequestContext) -> dict[str, Any]:
-    """Create a playlist in MA (or replace the songs of an existing one)."""
-    playlists = ctx.server.mass.music.playlists
-    song_uris = [_track_uri(ctx, v) for v in ctx.get_all("songId")]
-    if (existing := ctx.get("playlistId")) is not None:
-        row = await _playlist_row(ctx, existing)
-        playlist_id = int(row["item_id"])
-        positions = tuple(p for p, _ in await _playlist_tracks(ctx, playlist_id, everything=True))
-        if positions:
-            await playlists._handle_remove_playlist_tracks(playlist_id, positions)
-    else:
-        playlist = await playlists.create_playlist(ctx.require("name"))
-        playlist_id = int(playlist.item_id)
-    if song_uris:
-        # the internal handler (as the smart playlist provider uses it) finishes the change
-        # before this call returns, so the app sees it on its next request
-        await playlists._handle_add_playlist_tracks(playlist_id, song_uris)
-    return await _playlist_by_id(ctx, playlist_id)
-
-
-@api_method("updatePlaylist")
-async def update_playlist(ctx: RequestContext) -> dict[str, Any]:
-    """Add songs to or remove songs from one of MA's own playlists."""
-    row = await _playlist_row(ctx, ctx.require("playlistId"))
-    playlist_id = int(row["item_id"])
-    playlists = ctx.server.mass.music.playlists
-    remove = {int(v) for v in ctx.get_all("songIndexToRemove") if v.isdigit()}
-    if remove:
-        tracks = await _playlist_tracks(ctx, playlist_id)
-        positions = tuple(p for i, (p, _) in enumerate(tracks) if i in remove)
-        if positions:
-            await playlists._handle_remove_playlist_tracks(playlist_id, positions)
-    song_uris = [_track_uri(ctx, v) for v in ctx.get_all("songIdToAdd")]
-    if song_uris:
-        await playlists._handle_add_playlist_tracks(playlist_id, song_uris)
-    if ctx.get("name") or ctx.get("comment"):
-        ctx.note = " (renaming and comments are not supported, ignored)"
-    return {}
-
-
-@api_method("deletePlaylist")
-async def delete_playlist(ctx: RequestContext) -> dict[str, Any]:
-    """Delete one of MA's own playlists."""
-    row = await _playlist_row(ctx, ctx.require("id"))
-    await ctx.server.mass.music.remove_item_from_library(MediaType.PLAYLIST, int(row["item_id"]))
-    return {}
-
-
 @api_method(*EMPTY_LISTS)
 async def empty_list(ctx: RequestContext) -> dict[str, Any]:
     """Answer calls for features this server doesn't have with an empty list."""
@@ -389,18 +317,6 @@ def _count_play(ctx: RequestContext, track: IndexedTrack) -> None:
         album.last_played = now
 
 
-def _track_uri(ctx: RequestContext, value: str) -> str:
-    """
-    Return the uri of a visible song: a library uri, or an Apple Music uri.
-
-    :param ctx: The request context.
-    :param value: The Subsonic song ID.
-    """
-    if (ref := apple_id(value, PREFIX_APPLE_TRACK)) is not None:
-        return create_uri(MediaType.TRACK, APPLE_DOMAIN, ref[1])
-    return create_uri(MediaType.TRACK, "library", str(track_from_id(ctx, value).id))
-
-
 async def _star_apple(ctx: RequestContext, ref: tuple[str, str], favorite: bool) -> None:
     """
     Add an Apple Music song, album or artist to MA's favourites, or remove it.
@@ -453,111 +369,3 @@ async def _scrobble_apple(ctx: RequestContext, item_id: str, submission: bool) -
         user_initiated=True,
     )
     ctx.note = f" (played '{track.name}' from Apple Music)"
-
-
-async def _builtin_playlists(ctx: RequestContext) -> list[Mapping[str, Any]]:
-    """
-    Return MA's own playlists from the library database.
-
-    :param ctx: The request context.
-    """
-    return await ctx.server.mass.music.database.get_rows_from_query(
-        "SELECT p.item_id, p.name, p.is_editable, p.timestamp_added, p.timestamp_modified "
-        "FROM playlists p JOIN provider_mappings pm "
-        "ON pm.item_id = p.item_id AND pm.media_type = 'playlist' "
-        "WHERE pm.provider_domain = 'builtin' ORDER BY p.sort_name",
-        limit=0,
-    )
-
-
-async def _playlist_row(ctx: RequestContext, value: str) -> Mapping[str, Any]:
-    """
-    Return the database row of one of MA's own playlists.
-
-    :param ctx: The request context.
-    :param value: The Subsonic playlist ID.
-    :raises SubsonicError: Not found (70).
-    """
-    _, playlist_id = parse_id(value, PREFIX_PLAYLIST)
-    for row in await _builtin_playlists(ctx):
-        if int(row["item_id"]) == playlist_id:
-            return row
-    raise SubsonicError(ERR_NOT_FOUND, "Playlist not found")
-
-
-async def _playlist_by_id(ctx: RequestContext, playlist_id: int) -> dict[str, Any]:
-    """
-    Return the playlist response for a playlist that was just created or changed.
-
-    :param ctx: The request context.
-    :param playlist_id: The library playlist id.
-    """
-    row = await _playlist_row(ctx, make_id(PREFIX_PLAYLIST, playlist_id))
-    songs = [song for _, song in await _playlist_tracks(ctx, playlist_id)]
-    entry = _playlist_entry(ctx, row, songs)
-    entry["entry"] = songs
-    return {"playlist": entry}
-
-
-async def _playlist_tracks(
-    ctx: RequestContext, playlist_id: int | str, everything: bool = False
-) -> list[tuple[int, dict[str, Any]]]:
-    """
-    Return (MA position, song entry) for the playlist songs a client can see.
-
-    Songs with a file come from the music folder; others are offered as Apple Music songs
-    when Apple Music is enabled.
-
-    :param ctx: The request context.
-    :param playlist_id: The library playlist id.
-    :param everything: Also return the positions of songs a client can't see (entry None).
-    """
-    index = ctx.server.index
-    catalog = ctx.server.catalog
-    result: list[tuple[int, Any]] = []
-    # MA's own playlists are local, so a fresh read is cheap and shows edits at once
-    async for item in ctx.server.mass.music.playlists.tracks(
-        str(playlist_id), "library", force_refresh=True
-    ):
-        track_id = index.track_by_uri.get(item.uri or "")
-        if track_id is None:
-            for mapping in getattr(item, "provider_mappings", ()):
-                uri = create_uri(MediaType.TRACK, mapping.provider_instance, mapping.item_id)
-                if (track_id := index.track_by_uri.get(uri)) is not None:
-                    break
-        track = index.get_track(track_id) if track_id is not None else None
-        entry: dict[str, Any] | None = None
-        if track is not None:
-            entry = ctx.mapper.song(track)
-        elif catalog.enabled and isinstance(item, Track):
-            entry = ctx.mapper.apple_song(item)
-        position = int(getattr(item, "position", 0) or len(result) + 1)
-        if entry is not None or everything:
-            result.append((position, entry))
-    return result
-
-
-def _playlist_entry(
-    ctx: RequestContext, row: Mapping[str, Any], songs: list[dict[str, Any]]
-) -> dict[str, Any]:
-    """
-    Return the Subsonic playlist entry.
-
-    :param ctx: The request context.
-    :param row: The playlist's database row.
-    :param songs: The playlist's song entries.
-    """
-    assert ctx.user is not None
-    playlist_id = make_id(PREFIX_PLAYLIST, row["item_id"])
-    return {
-        "id": playlist_id,
-        "name": row["name"],
-        "songCount": len(songs),
-        "duration": sum(int(s.get("duration") or 0) for s in songs),
-        "public": False,
-        "owner": ctx.user.username,
-        "created": iso_time(row["timestamp_added"]) or EMPTY_DATE,
-        "changed": iso_time(row["timestamp_modified"]) or EMPTY_DATE,
-        "coverArt": playlist_id,
-        "readonly": not row["is_editable"],
-    }

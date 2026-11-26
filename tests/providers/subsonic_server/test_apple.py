@@ -14,6 +14,7 @@ from music_assistant_models.media_items import (
     Album,
     Artist,
     ItemMapping,
+    Playlist,
     ProviderMapping,
     SearchResults,
     Track,
@@ -260,3 +261,89 @@ async def test_artist_known_only_by_name_is_found_by_search(
     artist = (await server.call("getArtist", id=song["artistId"]))["artist"]
     assert artist["name"] == "Black Sabbath"
     assert fetched == ["901", "901"]
+
+
+async def _add_apple_playlist(
+    server: Server,  # noqa: F811
+    item_id: str,
+    name: str,
+    in_library: bool,
+) -> int:
+    """
+    Add an Apple Music playlist to MA's library and return its library id.
+
+    :param server: The running server.
+    :param item_id: The Apple Music playlist id.
+    :param name: The playlist name.
+    :param in_library: Whether it is still in the Apple Music library.
+    """
+    playlist = Playlist(
+        item_id=item_id,
+        provider=APPLE,
+        name=name,
+        owner="me",
+        is_editable=True,
+        provider_mappings={
+            ProviderMapping(
+                item_id=item_id,
+                provider_domain="apple_music",
+                provider_instance=APPLE,
+                in_library=in_library,
+            )
+        },
+    )
+    added = await server.mass.music.playlists.add_item_to_library(playlist)
+    return int(added.item_id)
+
+
+@pytest.mark.usefixtures("apple")
+async def test_apple_playlists_show_with_their_songs(
+    server: Server,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Apple Music playlists in the library show, with songs that have a file or can be saved."""
+    rock = await _add_apple_playlist(server, "p.rock", "Rock", True)
+    await _add_apple_playlist(server, "p.gone", "Deleted in Apple Music", False)
+    index = server.provider.server.index  # type: ignore[union-attr]
+    crom = next(t for t in index.tracks.values() if t.name == "Anvil of Crom")
+    library_crom = await server.mass.music.tracks.get_library_item(crom.id)
+    library_crom.position = 1
+    apple_song = TRACKS["111"].__class__.from_dict(TRACKS["111"].to_dict())
+    apple_song.position = 2
+    blocked = TRACKS["222"].__class__.from_dict(TRACKS["222"].to_dict())
+    blocked.position = 3
+
+    async def _tracks(item_id: str, _provider: str, force_refresh: bool = False) -> Any:  # noqa: ARG001
+        assert int(item_id) == rock
+        for item in (library_crom, apple_song, blocked):
+            yield item
+
+    monkeypatch.setattr(server.mass.music.playlists, "tracks", _tracks)
+    listed = (await server.call("getPlaylists"))["playlists"]["playlist"]
+    names = [p["name"] for p in listed]
+    assert "Rock" in names
+    assert "Deleted in Apple Music" not in names
+    playlist = (await server.call("getPlaylist", id=f"pl-{rock}"))["playlist"]
+    assert [e["id"] for e in playlist["entry"]] == [f"tr-{crom.id}", "amt-111"]
+    assert playlist["songCount"] == 2
+    assert playlist["readonly"] is False
+    counted = next(
+        p
+        for p in (await server.call("getPlaylists"))["playlists"]["playlist"]
+        if p["name"] == "Rock"
+    )
+    assert counted["songCount"] == 2
+
+    added = AsyncMock()
+    removed = AsyncMock()
+    monkeypatch.setattr(server.mass.music.playlists, "_handle_add_playlist_tracks", added)
+    monkeypatch.setattr(server.mass.music.playlists, "_handle_remove_playlist_tracks", removed)
+    await server.call(
+        "updatePlaylist", playlistId=f"pl-{rock}", songIdToAdd="amt-111", songIndexToRemove=1
+    )
+    assert added.await_args is not None
+    assert added.await_args.args == (rock, ["apple_music://track/111"])
+    assert removed.await_args is not None
+    assert removed.await_args.args == (rock, (2,))
+    refused = await server.call("deletePlaylist", id=f"pl-{rock}")
+    assert refused["error"]["code"] == 50
