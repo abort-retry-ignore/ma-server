@@ -271,40 +271,6 @@ class YoutubeAudioCache:
                 if claimed:
                     _ACTIVE_DOWNLOADS.discard((self.root, item_id))
 
-    async def _ranged_download(
-        self, url: str, headers: dict[str, str], size: int
-    ) -> AsyncGenerator[bytes]:
-        """
-        Yield a file of known size, fetched in consecutive byte ranges.
-
-        :param url: The audio URL.
-        :param headers: The request headers (without a Range header).
-        :param size: The file size in bytes.
-        """
-        start = 0
-        while start < size:
-            end = min(start + _RANGE_SIZE, size) - 1
-            ranged = {**headers, "Range": f"bytes={start}-{end}"}
-            async with self.provider.mass.http_session.get(
-                url, headers=ranged, timeout=_DOWNLOAD_TIMEOUT
-            ) as response:
-                whole = start == 0 and response.status == 200
-                if response.status != 206 and not whole:
-                    raise AudioError(
-                        f"YouTube Music audio range request failed (HTTP {response.status})"
-                    )
-                got = 0
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    got += len(chunk)
-                    yield chunk
-            if whole:
-                # the server ignored the range and sent the whole file: the caller checks
-                # that it is the expected size
-                return
-            if got != end - start + 1:
-                raise AudioError("YouTube Music audio range came back short")
-            start = end + 1
-
     async def refresh_metadata(self, item_id: str) -> None:
         """Publish known metadata and an album cover for a cached track."""
         if self.library:
@@ -342,6 +308,40 @@ class YoutubeAudioCache:
     def library_relative_path(self, track: Track, item_id: str, entry: dict[str, Any]) -> str:
         """Return the library filename based on the latest known track metadata."""
         return _relative_path(track, item_id, str(entry.get("extension") or ""))
+
+    async def _ranged_download(
+        self, url: str, headers: dict[str, str], size: int
+    ) -> AsyncGenerator[bytes]:
+        """
+        Yield a file of known size, fetched in consecutive byte ranges.
+
+        :param url: The audio URL.
+        :param headers: The request headers (without a Range header).
+        :param size: The file size in bytes.
+        """
+        start = 0
+        while start < size:
+            end = min(start + _RANGE_SIZE, size) - 1
+            ranged = {**headers, "Range": f"bytes={start}-{end}"}
+            async with self.provider.mass.http_session.get(
+                url, headers=ranged, timeout=_DOWNLOAD_TIMEOUT
+            ) as response:
+                whole = start == 0 and response.status == 200
+                if response.status != 206 and not whole:
+                    raise AudioError(
+                        f"YouTube Music audio range request failed (HTTP {response.status})"
+                    )
+                got = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    got += len(chunk)
+                    yield chunk
+            if whole:
+                # the server ignored the range and sent the whole file: the caller checks
+                # that it is the expected size
+                return
+            if got != end - start + 1:
+                raise AudioError("YouTube Music audio range came back short")
+            start = end + 1
 
     async def _resolve_entry(self, item_id: str) -> tuple[dict[str, Any], str, int] | None:
         if not _SAFE_ID.fullmatch(item_id) or not (entry := await self._read_entry(item_id)):
