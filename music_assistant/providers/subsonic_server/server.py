@@ -86,6 +86,7 @@ class SubsonicServer:
         :param port: The port to listen on.
         """
         await self.storage.setup()
+        await self.playlists.start()
         await self._webserver.setup(
             bind_ip,
             port,

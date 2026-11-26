@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 async def get_playlists(ctx: RequestContext) -> dict[str, Any]:
     """Return MA's own playlists and the Apple Music playlists in the library."""
     book = ctx.server.playlists
-    book.start()
     entries = []
     for row in await book.rows():
         count, duration = book.count(row) or (0, 0)
@@ -101,7 +100,7 @@ async def _playlist_response(ctx: RequestContext, row: Mapping[str, Any]) -> dic
     :param row: The playlist's database row.
     """
     book = ctx.server.playlists
-    items = await book.items(int(row["item_id"]), refresh=book.needs_fresh_read(row))
+    items = await book.items(int(row["item_id"]), refresh=book.needs_fresh_read(row), strict=True)
     songs = [entry for _, song in items if (entry := _song(ctx, song)) is not None]
     entry = _playlist_entry(ctx, row, len(songs), sum(int(s.get("duration") or 0) for s in songs))
     entry["entry"] = songs
@@ -199,7 +198,7 @@ def _playlist_entry(
         "public": False,
         "owner": ctx.user.username,
         "created": iso_time(row["timestamp_added"]) or EMPTY_DATE,
-        "changed": iso_time(row["timestamp_modified"]) or EMPTY_DATE,
+        "changed": iso_time(ctx.server.playlists.changed(row)) or EMPTY_DATE,
         "coverArt": playlist_id,
         "readonly": not row["is_editable"],
     }

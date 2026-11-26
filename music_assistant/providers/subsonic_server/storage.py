@@ -6,6 +6,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from music_assistant.helpers.database import DatabaseConnection
 from music_assistant.helpers.json import json_dumps, json_loads
@@ -15,6 +16,7 @@ from .constants import DB_FILE
 TABLE_META = "meta"
 TABLE_PLAY_QUEUE = "play_queue"
 TABLE_RATINGS = "ratings"
+TABLE_PLAYLISTS = "playlist_state"
 META_IMAGE_SECRET = "image_secret"
 
 
@@ -59,6 +61,12 @@ class Storage:
             f"CREATE TABLE IF NOT EXISTS {TABLE_RATINGS} ("
             "user_id TEXT NOT NULL, item_id TEXT NOT NULL, rating INTEGER NOT NULL, "
             "PRIMARY KEY (user_id, item_id))"
+        )
+        await db.execute(
+            f"CREATE TABLE IF NOT EXISTS {TABLE_PLAYLISTS} ("
+            "playlist_id INTEGER PRIMARY KEY, signature TEXT NOT NULL, "
+            "song_count INTEGER NOT NULL, duration INTEGER NOT NULL, changed REAL NOT NULL, "
+            "counted REAL NOT NULL, stamp INTEGER NOT NULL DEFAULT 0)"
         )
         await db.commit()
         self._db = db
@@ -150,3 +158,18 @@ class Storage:
         await self._db.insert_or_replace(
             TABLE_RATINGS, {"user_id": user_id, "item_id": item_id, "rating": rating}
         )
+
+    async def get_playlist_states(self) -> list[dict[str, Any]]:
+        """Return what is known about each playlist's songs (count, signature, change time)."""
+        assert self._db is not None
+        rows = await self._db.get_rows(TABLE_PLAYLISTS, limit=0)
+        return [dict(row) for row in rows]
+
+    async def save_playlist_state(self, state: dict[str, Any]) -> None:
+        """
+        Save what is known about a playlist's songs.
+
+        :param state: playlist_id, signature, song_count, duration, changed, counted, stamp.
+        """
+        assert self._db is not None
+        await self._db.insert_or_replace(TABLE_PLAYLISTS, state)

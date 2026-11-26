@@ -479,3 +479,41 @@ async def test_apple_only_favourites_are_starred(
     assert "amt-777" in songs
     assert songs["amt-777"]["starred"]
     assert songs["amt-777"]["title"] == "Lucky Girl"
+
+
+@pytest.mark.usefixtures("apple")
+async def test_playlist_change_date_follows_its_songs(
+    server: Server,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New songs move a playlist's change date; an empty read from Apple is not passed on."""
+    hits = await _add_apple_playlist(server, "p.hits", "Alternative Hits", True)
+    songs: list[Any] = [TRACKS["111"].__class__.from_dict(TRACKS["111"].to_dict())]
+
+    async def _tracks(item_id: str, _provider: str, force_refresh: bool = False) -> Any:  # noqa: ARG001
+        for position, song in enumerate(songs, start=1):
+            song.position = position
+            yield song
+
+    monkeypatch.setattr(server.mass.music.playlists, "tracks", _tracks)
+    first = (await server.call("getPlaylist", id=f"pl-{hits}"))["playlist"]
+    assert first["songCount"] == 1
+    await asyncio.sleep(0.01)
+    same = (await server.call("getPlaylist", id=f"pl-{hits}"))["playlist"]
+    assert same["changed"] == first["changed"]
+    # Apple returns nothing (a failed read): the app gets an error, the count is kept
+    songs.clear()
+    failed = await server.call("getPlaylist", id=f"pl-{hits}")
+    assert failed["error"]["code"] == 0
+    listed = next(
+        p
+        for p in (await server.call("getPlaylists"))["playlists"]["playlist"]
+        if p["id"] == f"pl-{hits}"
+    )
+    assert listed["songCount"] == 1
+    # the playlist gets another song: its change date moves, so apps fetch it again
+    songs.extend([TRACKS["111"], TRACKS["333"]])
+    await asyncio.sleep(0.01)
+    grown = (await server.call("getPlaylist", id=f"pl-{hits}"))["playlist"]
+    assert grown["songCount"] == 2
+    assert grown["changed"] > first["changed"]

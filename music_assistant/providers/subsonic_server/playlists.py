@@ -10,6 +10,7 @@ fills slowly, one playlist at a time; opening a playlist always reads it fresh.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
@@ -19,6 +20,7 @@ from music_assistant_models.media_items import Track
 
 from .constants import (
     APPLE_DOMAIN,
+    ERR_GENERIC,
     ERR_NOT_FOUND,
     PLAYLIST_COUNT_INTERVAL,
     PLAYLIST_COUNT_MAX_AGE,
@@ -49,8 +51,8 @@ class PlaylistBook:
         self.server = server
         self.mass = server.mass
         self.logger = server.logger
-        # playlist id -> (song count, duration, playlist's timestamp_modified, when counted)
-        self._counts: dict[int, tuple[int, int, int, float]] = {}
+        # playlist id -> saved state: signature, song_count, duration, changed, counted, stamp
+        self._states: dict[int, dict[str, Any]] = {}
         self._edited: set[int] = set()
         self._task: asyncio.Task[None] | None = None
 
@@ -78,9 +80,11 @@ class PlaylistBook:
             return True
         return bool(row["provider_domain"] == BUILTIN)
 
-    def start(self) -> None:
-        """Start counting songs in the background."""
+    async def start(self) -> None:
+        """Load what is known about the playlists and start counting songs in the background."""
         if self._task is None:
+            for state in await self.server.storage.get_playlist_states():
+                self._states[int(state["playlist_id"])] = state
             self._task = asyncio.create_task(self._count_loop())
 
     async def stop(self) -> None:
@@ -126,14 +130,16 @@ class PlaylistBook:
         raise SubsonicError(ERR_NOT_FOUND, "Playlist not found")
 
     async def items(
-        self, playlist_id: int, refresh: bool, everything: bool = False
+        self, playlist_id: int, refresh: bool, everything: bool = False, strict: bool = False
     ) -> list[tuple[int, IndexedTrack | Track | None]]:
         """
-        Return (MA position, playable song) for a playlist, and remember its song count.
+        Return (MA position, playable song) for a playlist, and remember what it holds.
 
         :param playlist_id: The library playlist id.
         :param refresh: Read the playlist fresh instead of from MA's cache.
         :param everything: Also return songs that can't be played (song None), for positions.
+        :param strict: Raise instead of returning nothing when a playlist that had songs comes
+            back empty (an Apple hiccup), so an app doesn't keep an empty copy.
         """
         result: list[tuple[int, IndexedTrack | Track | None]] = []
         async for item in self.mass.music.playlists.tracks(
@@ -144,13 +150,33 @@ class PlaylistBook:
             if song is not None or everything:
                 result.append((position, song))
         songs = [s for _, s in result if s is not None]
-        stamp = await self._stamp(playlist_id)
-        self._counts[playlist_id] = (
-            len(songs),
-            sum(int(s.duration or 0) for s in songs),
-            stamp,
-            time.monotonic(),
-        )
+        known = self._states.get(playlist_id)
+        if not songs and known is not None and known["song_count"] > 0 and not refresh:
+            # most likely a failed read: keep what was known instead of an empty playlist
+            self.logger.debug(
+                "Playlist %s came back empty, keeping its %s songs",
+                playlist_id,
+                known["song_count"],
+            )
+            if strict:
+                raise SubsonicError(ERR_GENERIC, "The playlist could not be read, try again")
+            return result
+        ids = [self._song_id(s) for s in songs]
+        signature = hashlib.sha1("\n".join(ids).encode()).hexdigest()
+        now = time.time()
+        state = {
+            "playlist_id": playlist_id,
+            "signature": signature,
+            "song_count": len(songs),
+            "duration": sum(int(s.duration or 0) for s in songs),
+            "changed": now
+            if known is None or known["signature"] != signature
+            else known["changed"],
+            "counted": now,
+            "stamp": await self._stamp(playlist_id),
+        }
+        self._states[playlist_id] = state
+        await self.server.storage.save_playlist_state(state)
         return result
 
     def count(self, row: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -159,10 +185,31 @@ class PlaylistBook:
 
         :param row: The playlist's database row.
         """
-        counted = self._counts.get(int(row["item_id"]))
-        if counted is None:
+        state = self._states.get(int(row["item_id"]))
+        if state is None:
             return None
-        return counted[0], counted[1]
+        return int(state["song_count"]), int(state["duration"])
+
+    def changed(self, row: Mapping[str, Any]) -> float:
+        """
+        Return when a playlist last changed: in MA, or in the songs it holds.
+
+        Apps refetch a playlist only when this moves, so a change in songs must move it.
+
+        :param row: The playlist's database row.
+        """
+        state = self._states.get(int(row["item_id"]))
+        return max(float(row["timestamp_modified"] or 0), float(state["changed"]) if state else 0.0)
+
+    def _song_id(self, song: IndexedTrack | Track) -> str:
+        """
+        Return the Subsonic ID a playlist song is shown with.
+
+        :param song: A song with a file, or an Apple Music track.
+        """
+        if isinstance(song, Track):
+            return f"amt-{self.server.catalog.apple_track_id(song)}"
+        return f"tr-{song.id}"
 
     def _playable(self, item: Any) -> IndexedTrack | Track | None:
         """
@@ -201,12 +248,12 @@ class PlaylistBook:
             counted = 0
             for row in await self.rows():
                 playlist_id = int(row["item_id"])
-                known = self._counts.get(playlist_id)
+                known = self._states.get(playlist_id)
                 stamp = int(row["timestamp_modified"] or 0)
                 if (
                     known is not None
-                    and known[2] == stamp
-                    and time.monotonic() - known[3] < PLAYLIST_COUNT_MAX_AGE
+                    and int(known["stamp"]) == stamp
+                    and time.time() - float(known["counted"]) < PLAYLIST_COUNT_MAX_AGE
                 ):
                     continue
                 try:
