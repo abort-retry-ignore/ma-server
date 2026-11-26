@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 from music_assistant_models.enums import ImageType, MediaType, ProviderType, StreamType
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.helpers import create_uri
-from music_assistant_models.media_items import SearchResults
+from music_assistant_models.media_items import ItemMapping, SearchResults
 
 from .constants import (
     APPLE_DOMAIN,
@@ -40,6 +40,8 @@ from .index import normalize
 from .responses import SubsonicError
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from music_assistant_models.media_items import Album, Artist, Track
 
     from .index import IndexedTrack
@@ -268,6 +270,39 @@ class AppleCatalog:
         if self._is_domain(provider, YOUTUBE_DOMAIN):
             return f"{YOUTUBE_MARK}{item_id}" if self.youtube_enabled else None
         return None
+
+    def catalogue_track_id(self, uris: Iterable[str]) -> str | None:
+        """
+        Return the catalogue id of a library song from its uris: Apple Music first, then YouTube.
+
+        :param uris: The song's uris (one per provider mapping).
+        """
+        found: list[str] = []
+        for uri in uris:
+            provider, _, rest = uri.partition("://")
+            kind, _, item_id = rest.partition("/")
+            if kind == "track" and item_id and (ref := self.ref_id(provider, item_id)):
+                found.append(ref)
+        apple = [f for f in found if not is_youtube_id(f)]
+        return next(iter(apple or found), None)
+
+    def album_id_of(self, track: Track) -> str | None:
+        """
+        Return the catalogue id of a service track's album (a name reference if only named).
+
+        :param track: An Apple or YouTube Music track.
+        """
+        album = track.album
+        if album is None:
+            return None
+        if isinstance(album, ItemMapping):
+            item_id = self.ref_id(album.provider, album.item_id)
+        else:
+            item_id = self._catalogue_id(album)
+        if item_id is None:
+            return None
+        artist = track.artists[0].name if track.artists else None
+        return name_ref(item_id, album.name, artist)
 
     @staticmethod
     def service_name(item_id: str) -> str:

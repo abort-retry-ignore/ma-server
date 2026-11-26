@@ -25,6 +25,7 @@ from .mapping import (
     PREFIX_ALBUM,
     PREFIX_ARTIST,
     PREFIX_TRACK,
+    display_name,
     iso_time,
     make_id,
     parse_id,
@@ -82,7 +83,14 @@ async def get_album(ctx: RequestContext) -> dict[str, Any]:
         tracks = await catalog.album_tracks(ref[1])
         return {"album": ctx.mapper.apple_album(apple_album, tracks)}
     album = _album(ctx, value)
-    return {"album": ctx.mapper.album(album, with_songs=True)}
+    entry = ctx.mapper.album(album)
+    songs = await _album_songs(ctx, album)
+    entry.update(
+        song=songs,
+        songCount=len(songs),
+        duration=sum(int(s.get("duration") or 0) for s in songs),
+    )
+    return {"album": entry}
 
 
 @api_method("getSong")
@@ -112,14 +120,15 @@ async def get_music_directory(ctx: RequestContext) -> dict[str, Any]:
         }
     album = _album(ctx, value)
     child = ctx.mapper.album_child(album)
+    songs = await _album_songs(ctx, album)
     return {
         "directory": {
-            "child": [ctx.mapper.song(t) for t in index.album_tracks(album)],
+            "child": songs,
             "id": value,
             "name": child["name"],
             "parent": child["parent"],
             "coverArt": value,
-            "songCount": child["songCount"],
+            "songCount": len(songs),
         }
     }
 
@@ -407,6 +416,50 @@ async def search(ctx: RequestContext) -> dict[str, Any]:
         f"{len(result.get('artist', []))} artists)"
     )
     return {"searchResult3" if id3 else "searchResult2": result}
+
+
+async def _album_songs(ctx: RequestContext, album: IndexedAlbum) -> list[dict[str, Any]]:
+    """
+    Return an album's songs, completed from the Apple or YouTube Music album they were saved from.
+
+    Songs saved from a service form an album of just those songs; the songs not saved yet are
+    listed with them, in the service album's order, so they can be played (and saved).
+
+    :param ctx: The request context.
+    :param album: The album in the music folder.
+    """
+    mapper = ctx.mapper
+    catalog = ctx.server.catalog
+    local = ctx.server.index.album_tracks(album)
+    songs = [mapper.song(t) for t in local]
+    if not catalog.enabled:
+        return songs
+    source = next((i for t in local if (i := catalog.catalogue_track_id(t.uris))), None)
+    if source is None:
+        return songs
+    try:
+        source_album = catalog.album_id_of(await catalog.track(source))
+        service_tracks = await catalog.album_tracks(source_album) if source_album else []
+    except SubsonicError as err:
+        ctx.server.logger.debug("Could not complete album '%s': %s", album.name, err.message)
+        return songs
+    album_id = make_id(PREFIX_ALBUM, album.id)
+    album_name = display_name(album.name, album.version)
+    completed: list[dict[str, Any]] = []
+    shown: set[int] = set()
+    for track in service_tracks:
+        if (item_id := catalog.apple_track_id(track)) is None:
+            continue
+        if (saved := catalog.library_track(item_id)) is not None:
+            if saved.id not in shown:
+                shown.add(saved.id)
+                completed.append(mapper.song(saved))
+            continue
+        if (entry := mapper.apple_song(track)) is not None:
+            entry.update(parent=album_id, albumId=album_id, album=album_name)
+            completed.append(entry)
+    completed += [mapper.song(t) for t in local if t.id not in shown]
+    return completed
 
 
 def _new_tracks(

@@ -560,3 +560,38 @@ async def test_library_albums_without_a_file_are_found(
     artist_ids = [a["id"] for a in found.get("artist", [])]
     assert "amr-3" in artist_ids
     assert "amr-77" not in artist_ids
+
+
+async def test_album_saved_from_apple_lists_the_songs_it_lacks(
+    server: Server,  # noqa: F811
+    apple: FakeStreams,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local album of songs saved from Apple also lists the Apple album's other songs."""
+    assert apple is not None
+    subsonic = server.provider.server
+    assert subsonic is not None
+    index = subsonic.index
+    crom = next(t for t in index.tracks.values() if t.name == "Anvil of Crom")
+    assert crom.album_id is not None
+    crom.uris = (*crom.uris, "apple_music://track/333")
+    index.track_by_uri["apple_music://track/333"] = crom.id
+    catalog = subsonic.catalog
+    album_tracks = AsyncMock(return_value=[TRACKS["333"], TRACKS["111"]])
+    monkeypatch.setattr(catalog, "album_tracks", album_tracks)
+    local_ids = [f"tr-{t.id}" for t in index.album_tracks(index.albums[crom.album_id])]
+    album = (await server.call("getAlbum", id=f"al-{crom.album_id}"))["album"]
+    ids = [s["id"] for s in album["song"]]
+    assert ids[:2] == [f"tr-{crom.id}", "amt-111"]
+    assert sorted(ids[2:]) == sorted(i for i in local_ids if i != f"tr-{crom.id}")
+    assert album["songCount"] == len(ids)
+    added = album["song"][1]
+    assert added["albumId"] == f"al-{crom.album_id}"
+    assert album_tracks.await_args is not None
+    assert album_tracks.await_args.args == ("800",)
+    directory = (await server.call("getMusicDirectory", id=f"al-{crom.album_id}"))["directory"]
+    assert [c["id"] for c in directory["child"]] == ids
+    # an album none of whose songs came from a service is left as it is
+    other = next(a for a in index.albums.values() if a.id != crom.album_id and a.id > 0)
+    plain = (await server.call("getAlbum", id=f"al-{other.id}"))["album"]
+    assert all(s["id"].startswith("tr-") for s in plain["song"])
